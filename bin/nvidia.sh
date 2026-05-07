@@ -2,7 +2,7 @@
 set -e
 
 # 1. Get GPU ID
-GPU_ID=$(lspci -nn -d 10de: | grep -E "VGA|3D" | head -n1 | grep -oP '(?<=\[10de:)[0-9a-fA-F]{4}(?=\])')
+GPU_ID=$(lspci -nn -d 10de: | grep -E "VGA|3D" | head -n1 | grep -oP '(?<=\[10de:)[0-9a-fA-F]{4}(?=\])' || true)
 
 if [[ -z "$GPU_ID" ]]; then
     echo "No NVIDIA GPU found. Skipping."
