@@ -1,7 +1,7 @@
 # omarchy-on-cachyos
 
-UPDATE 20-May-2026: The install script now includes interactive version selection for choosing between Stable releases and Bleeding Edge.
-UPDATE 1-October-2025: The install script has been updated to support Omarchy 3.0+ out of the box. 
+- UPDATE 20-May-2026: The install script now includes interactive version selection for choosing between Stable releases and Bleeding Edge.
+- UPDATE 1-October-2025: The install script has been updated to support Omarchy 3.0+ out of the box.
 
 ## 1. Introduction
 
