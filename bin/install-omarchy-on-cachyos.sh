@@ -8,10 +8,11 @@ fi
 
 # Fetch Omarchy from repo
 echo "Fetching Omarchy source..."
-if [ -f "./bin/fetch-omarchy.sh" ]; then
-    bash ./bin/fetch-omarchy.sh
+if [ -f "./fetch-omarchy.sh" ]; then
+    chmod +x ./fetch-omarchy.sh
+    ./fetch-omarchy.sh
 else
-    # Fallback if script is missing or run from different dir
+    # Fallback if script is missing
     echo "fetch-omarchy.sh not found, falling back to default clone..."
     git clone https://www.github.com/basecamp/omarchy ../omarchy
 fi
