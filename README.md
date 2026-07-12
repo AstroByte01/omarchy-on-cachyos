@@ -1,7 +1,12 @@
 # omarchy-on-cachyos
 
+[![CI](https://github.com/th3rig/omarchy-on-cachyos/actions/workflows/ci.yml/badge.svg)](https://github.com/th3rig/omarchy-on-cachyos/actions/workflows/ci.yml)
+
+Based on [mroboff/omarchy-on-cachyos](https://github.com/mroboff/omarchy-on-cachyos) (MIT); this is an independently maintained continuation.
+
+- UPDATE 12-Jul-2026: Every compatibility patch is now verified after applying (the installer aborts if upstream Omarchy drifts), Omarchy's hibernation setup is disabled on CachyOS, non-interactive version selection via `--ref`, and CI tests every supported Omarchy release weekly. Also: dry-run, prepare-only, safer defaults, SDDM backup, optional autologin, and optional NetworkManager/iwd changes.
 - UPDATE 20-May-2026: The install script now includes interactive version selection for choosing between Stable releases and Bleeding Edge.
-- UPDATE 1-October-2025: The install script has been updated to support Omarchy 3.0+ out of the box.
+- UPDATE 1-Oct-2025: The install script has been updated to support Omarchy 3.0+ out of the box.
 
 ## 1. Introduction
 
@@ -9,19 +14,19 @@ This project provides an installation script for implementing DHH's Omarchy conf
 
 ## 2. What This Script Does and Does Not Do
 
-This installation script does the following three things:
+This installation script does the following four things:
 
-  1) Prompts for and fetches your preferred version of Omarchy (Stable tags or Bleeding Edge)
-  2) Makes adjustments to the Omarchy install scripts to support installation on CachyOS
+  1) Prompts for and fetches your preferred version of Omarchy. The latest stable tag is the default, and "Bleeding Edge" is upstream's `dev` branch.
+  2) Makes adjustments to the Omarchy install scripts to support installation on CachyOS, verifying every patch after applying it (the installer aborts with the name of the failed patch if upstream Omarchy has changed underneath it)
   3) Launches the installation of Omarchy on an already setup CachyOS system
-  4) Installs and configures NVIDIA 580xx proprietary drivers
+  4) Detects NVIDIA hardware, preserves existing CachyOS NVIDIA drivers, and installs drivers via `chwd` only when no NVIDIA driver is present
 
 This script does not:
 
  1) Install CachyOS or any other Linux operating system
  2) Partition, format, or encrypt hard disks
  3) Install or configure a boot loader
- 5) Install or configure a login display manager
+ 4) Install or configure a login display manager
 
 All of the above need to be done when you install CachyOS. 
 
@@ -37,36 +42,41 @@ The philosophy behind this script is to produce a strong and stable blend of Cac
 
 3. TLDR implementation: CachyOS installs Tealdeer by default, which is a TLDR implementation written in Rust. This script will preserve use of Tealdeer.
 
-4. Mise: Omarchy will setup Mise to run automatically via mise-activate. This script will supply the right mise-activate command for the fish shell.
+4. Mise: Omarchy activates mise with `mise activate bash --shims`, which is a shell-agnostic PATH addition that uwsm exports session-wide — fish shells inherit it without any changes. This script leaves that line alone and only upgrades the archaic non-`--shims` form if an old Omarchy release still ships it.
 
-5. Login System: As a distribution, Omarchy skips installation of a login display manager. Instead, Hyprland autostarts and password protection is provided upon boot by the LUKS full disk encryption service. This script, however, assumes a display manager is installed. (Note: this script does not install a display manager, but also does not configure Hyprland to start automatically if a display manager is not installed.)
+5. Login System: As a distribution, Omarchy skips installation of a login display manager. Instead, Hyprland autostarts and password protection is provided upon boot by the LUKS full disk encryption service. This script can either keep your existing display-manager login flow or allow Omarchy autologin. If autologin is enabled, `/etc/sddm.conf` is backed up before removal.
 
 6. Full Disk Encryption: As a distribution, Omarchy automatically turns on full disk encryption via LUKS. This script, however, leaves this decision up to the user. CachyOS can be installed with or without full disk encryption, and this script will install Omarchy on either setup.
 
-7. NVIDIA Drivers: *By default, CachyOS and Omarchy may attempt to use the latest NVIDIA drivers with open kernel modules. This script explicitly downgrades/pins the driver to the* *580xx proprietary series* *using CachyOS's* `chwd` *tool. This is a deliberate choice to fix widespread issues with hardware acceleration, electron apps, and browser flickering.*
+7. NVIDIA Drivers: The current script does not force a downgrade or pin to the 580xx proprietary series. It detects NVIDIA hardware, respects an existing CachyOS NVIDIA driver installation, and only calls CachyOS `chwd` when no NVIDIA driver is present.
+
+8. Network: The script does not force NetworkManager to use `iwd` unless you explicitly choose that option. Without that option, it preserves the existing NetworkManager/wpa_supplicant behavior beyond Omarchy's upstream hardware script.
+
+9. Hibernation: Omarchy's installer runs its hibernation setup non-interactively, which on CachyOS would silently create a swapfile as large as your RAM and write resume configuration only its own Limine bootloader understands — GRUB, the CachyOS default, would never see it. This script disables that step. If you want hibernation, configure it with CachyOS's own tools afterwards.
 
 ## 4. Pre-Requisites
 
 IMPORTANT: This script does not install CachyOS. You must do that separately (and first.) This script is intended to be run on a fresh installation of CachyOS with the following configuration choices made: (Note, for information on installing CachyOS, please refer to https://www.cachyos.org.) 
 
-1. File System: You must choose BTRFS as the file system and Snapper as the snapshot manager. This aligns with CachyOS's default recommendation for most systems, and is required for Omarchy to properly function.
+1. File System: BTRFS with Snapper is still recommended. This adapter disables Omarchy bootloader/snapshot scripts that conflict with CachyOS, so the installer preflight treats non-BTRFS as a warning rather than a hard adapter failure.
 
 2. Shell: You must choose Fish as the default shell for this installation script to work properly. (This is the default CachyOS shell choice.)
 
-3. Desktop Environment to Install: You can install a minimal system with no desktop environment or you can choose to install the CachyOS Hyprland Desktop Environment. If you have CachyOS install Hyprland, it will also install SDDM as the login display manager by default. Do not install GNOME or KDE.
+3. Desktop Environment to Install: A fresh minimal or CachyOS Hyprland install is still the safest target. The adapter can also keep an existing display-manager login flow and install Omarchy as a selectable Wayland session.
 
-4. Graphics Drivers for NVIDIA users: 
-
-5. This script now automatically handles NVIDIA driver installation by enforcing the proprietary 580xx drivers (via CachyOS `chwd`). This is necessary to avoid known regressions with hardware video decoding and browser flickering present in the newer open-kernel module drivers.
+4. Graphics Drivers for NVIDIA users: This script automatically handles NVIDIA driver setup by preserving the driver CachyOS already installed. If no NVIDIA driver is detected, it uses CachyOS `chwd` to install one. It also installs `libva-nvidia-driver` (the VAAPI backend for hardware video decode) and writes the NVIDIA session environment to `~/.config/uwsm/env.d/90-nvidia.conf`, where Omarchy's own config refreshes cannot overwrite it.
 
    **Important:** 
 
    To enable hardware video decode via NVDEC in chromium, you must:
    
-   1. Add the following to `~/.config/chromium-flags.conf`:       ```       --enable-features=VaapiOnNvidiaGPUs       ```
+   1. Add the following to `~/.config/chromium-flags.conf`:
+
+      ```
+      --enable-features=VaapiOnNvidiaGPUs
+      ```
+
    2. Install the [enhanced-h264ify extension](https://chromewebstore.google.com/detail/enhanced-h264ify/omkfmpieigblcllmkgbflkikinpkodlk) and disable **VP8** and **AV1** codecs.
-   
-   
    
    To fully enable hardware acceleration in Firefox, you must 
    
@@ -91,19 +101,47 @@ Other configuration changes are up to you. Note, however, that this script has n
 
 ```bash
 # Clone the repository
-git clone https://github.com/mroboff/omarchy-on-cachyos.git
+git clone https://github.com/th3rig/omarchy-on-cachyos.git
 
 # Navigate to the project directory
-cd omarchy-on-cachyos/bin
+cd omarchy-on-cachyos
 
-# Make the script executable
-chmod +x install-omarchy-on-cachyos.sh
+# Inspect what would happen without changing the system
+./bin/install-omarchy-on-cachyos.sh --dry-run
 
-# Run the installation script
-./install-omarchy-on-cachyos.sh
+# Optional: fetch and patch Omarchy, then stop before sudo/pacman/install.sh
+./bin/install-omarchy-on-cachyos.sh --prepare-only --no-auto-login --keep-network
+
+# Run the full installer only after reviewing the dry-run and prepare-only output
+./bin/install-omarchy-on-cachyos.sh --no-auto-login --keep-network
 ```
 
 **Note:** Please review the script contents before running to understand what changes will be made to your system.
+
+### Installer Options
+
+- `--dry-run`: prints preflight state and planned actions without cloning, installing packages, touching `/etc`, changing services, or running Omarchy.
+- `--prepare-only`: fetches Omarchy and applies compatibility patches, then stops before sudo system setup, `pacman`, copying to `~/.local/share/omarchy`, or running `install.sh`. Does not prompt for name/email (those are only used by the full install).
+- `--ref <tag|branch>`: fetches that Omarchy version without showing the interactive menu (for example `--ref v3.8.2` or `--ref dev`). Also honored from the `OMARCHY_REF` environment variable.
+- `--auto-login`: allows Omarchy to configure SDDM autologin. If `/etc/sddm.conf` exists, it is backed up before removal.
+- `--no-auto-login`: keeps the existing display-manager flow, including CachyOS `plasmalogin`, and installs Omarchy as a selectable Wayland session when supported by the display manager.
+- `--network-iwd`: adds a CachyOS compatibility block that disables `wpa_supplicant` and writes `/etc/NetworkManager/conf.d/omarchy-iwd.conf`.
+- `--keep-network`: avoids the extra NetworkManager/iwd compatibility block.
+
+Recommended first pass:
+
+```bash
+./bin/install-omarchy-on-cachyos.sh --dry-run
+./bin/install-omarchy-on-cachyos.sh --prepare-only --no-auto-login --keep-network
+```
+
+If the prepare-only output looks correct, run the full installer with the same login/network choices.
+
+If the fetched Omarchy tree already exists, the fetch step asks whether to keep or replace it; `bin/fetch-omarchy.sh` also accepts `--keep-existing` and `--force` (env `OMARCHY_ON_EXISTING=keep|replace`) for scripted runs.
+
+### Supported Omarchy versions
+
+The version menu offers the five newest upstream release tags plus Bleeding Edge (upstream's `dev` branch). CI runs the patching step against all of them weekly — the supported versions are exactly the ones the CI badge is green for. Every patch is verified after it is applied, so if upstream Omarchy changes in a way this adapter doesn't expect, the installer stops with the name of the failed patch instead of continuing with a half-patched tree.
 
 ## 6. Statement of Lack of Warranty
 
