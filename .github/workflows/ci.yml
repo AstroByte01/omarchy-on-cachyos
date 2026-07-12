@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly: catches upstream Omarchy drift without repo activity.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck --severity=warning bin/*.sh
+
+  refs:
+    # Mirrors the fetch menu: the 5 newest upstream tags, plus the dev branch.
+    # New upstream releases enter the matrix automatically.
+    runs-on: ubuntu-latest
+    outputs:
+      refs: ${{ steps.list.outputs.refs }}
+    steps:
+      - name: List supported Omarchy refs
+        id: list
+        run: |
+          tags=$(git ls-remote --tags --refs https://github.com/basecamp/omarchy \
+            | awk -F/ '{print $3}' | sort -rV | head -n 5)
+          refs=$(printf '%s\n' $tags dev | jq -R . | jq -sc .)
+          echo "refs=$refs" >> "$GITHUB_OUTPUT"
+          echo "Testing refs: $refs"
+
+  smoke:
+    needs: refs
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(needs.refs.outputs.refs) }}
+    steps:
+      - name: Install tooling
+        run: pacman -Syu --noconfirm git sudo curl gawk diffutils
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare-only patch run (drift gate)
+        run: ./bin/install-omarchy-on-cachyos.sh --ref "${{ matrix.ref }}" --prepare-only --no-auto-login --network-iwd
+
+      - name: Re-run on the same tree (idempotency gate)
+        run: |
+          cp -a omarchy /tmp/run1
+          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "${{ matrix.ref }}" --prepare-only --no-auto-login --network-iwd
+          diff -ru /tmp/run1 omarchy
+
+      - name: Independent post-state checks
+        run: |
+          set -x
+          ! grep -q 'run_logged .*hibernation.sh' omarchy/install/login/all.sh
+          ! grep -q 'run_logged .*plymouth.sh' omarchy/install/login/all.sh
+          ! grep -q 'run_logged .*preflight/pacman.sh' omarchy/install/preflight/all.sh
+          ! grep -q 'cachyos-release' omarchy/install/preflight/guard.sh
+          ! grep -q '^tldr$' omarchy/install/omarchy-base.packages
+          ! grep -qE '^ln -s |ln -sffn' omarchy/install/config/omarchy-ai-skill.sh
+          grep -q 'ln -sfn' omarchy/install/config/omarchy-ai-skill.sh
+          grep -q 'wifi.backend=iwd' omarchy/install/config/hardware/network.sh
+          grep -q 'CachyOS walker repo pin' omarchy/install/config/walker-elephant.sh
+          grep -q 'Minimal SDDM integration' omarchy/install/login/sddm.sh
+          grep -q 'NVIDIA configuration for Omarchy on CachyOS' omarchy/install/config/hardware/nvidia.sh
