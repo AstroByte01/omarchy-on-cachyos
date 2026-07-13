@@ -25,10 +25,16 @@ jobs:
     steps:
       - name: List supported Omarchy refs
         id: list
+        shell: bash
         run: |
-          tags=$(git ls-remote --tags --refs https://github.com/basecamp/omarchy \
-            | awk -F/ '{print $3}' | sort -rV | head -n 5)
-          refs=$(printf '%s\n' $tags dev | jq -R . | jq -sc .)
+          set -euo pipefail
+          mapfile -t tags < <(git ls-remote --tags --refs https://github.com/basecamp/omarchy \
+            | awk -F/ '{print $3}' | sort -rV)
+          if [ "${#tags[@]}" -lt 5 ]; then
+            echo "Expected at least 5 upstream tags, got ${#tags[@]}: ${tags[*]-none}"
+            exit 1
+          fi
+          refs=$(printf '%s\n' "${tags[@]:0:5}" dev | jq -R . | jq -sc .)
           echo "refs=$refs" >> "$GITHUB_OUTPUT"
           echo "Testing refs: $refs"
 
@@ -40,32 +46,48 @@ jobs:
       fail-fast: false
       matrix:
         ref: ${{ fromJSON(needs.refs.outputs.refs) }}
+    env:
+      # Passed via env, not inline interpolation: upstream tag names are
+      # third-party input and must not be parsed by the shell.
+      OMARCHY_CI_REF: ${{ matrix.ref }}
     steps:
       - name: Install tooling
-        run: pacman -Syu --noconfirm git sudo curl gawk diffutils
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm git sudo curl gawk diffutils
 
       - uses: actions/checkout@v4
 
       - name: Prepare-only patch run (drift gate)
-        run: ./bin/install-omarchy-on-cachyos.sh --ref "${{ matrix.ref }}" --prepare-only --no-auto-login --network-iwd
+        run: ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --prepare-only --no-auto-login --network-iwd
 
       - name: Re-run on the same tree (idempotency gate)
         run: |
           cp -a omarchy /tmp/run1
-          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "${{ matrix.ref }}" --prepare-only --no-auto-login --network-iwd
+          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --prepare-only --no-auto-login --network-iwd
           diff -ru /tmp/run1 omarchy
 
       - name: Independent post-state checks
+        # Explicit exit-1 forms: under 'bash -e' a failing '! grep' pipeline
+        # does NOT abort the step (errexit exempts !-prefixed pipelines).
         run: |
-          set -x
-          ! grep -q 'run_logged .*hibernation.sh' omarchy/install/login/all.sh
-          ! grep -q 'run_logged .*plymouth.sh' omarchy/install/login/all.sh
-          ! grep -q 'run_logged .*preflight/pacman.sh' omarchy/install/preflight/all.sh
-          ! grep -q 'cachyos-release' omarchy/install/preflight/guard.sh
-          ! grep -q '^tldr$' omarchy/install/omarchy-base.packages
-          ! grep -qE '^ln -s |ln -sffn' omarchy/install/config/omarchy-ai-skill.sh
-          grep -q 'ln -sfn' omarchy/install/config/omarchy-ai-skill.sh
-          grep -q 'wifi.backend=iwd' omarchy/install/config/hardware/network.sh
-          grep -q 'CachyOS walker repo pin' omarchy/install/config/walker-elephant.sh
-          grep -q 'Minimal SDDM integration' omarchy/install/login/sddm.sh
-          grep -q 'NVIDIA configuration for Omarchy on CachyOS' omarchy/install/config/hardware/nvidia.sh
+          absent() {
+            [ -f "$2" ] || { echo "MISSING FILE: $2"; exit 1; }
+            if grep -qE "$1" "$2"; then echo "FORBIDDEN pattern '$1' found in $2"; exit 1; fi
+          }
+          present() {
+            grep -qE "$1" "$2" || { echo "EXPECTED pattern '$1' missing from $2"; exit 1; }
+          }
+          absent  'hibernation\.sh'      omarchy/install/login/all.sh
+          absent  'plymouth\.sh'         omarchy/install/login/all.sh
+          absent  'limine-snapper\.sh'   omarchy/install/login/all.sh
+          absent  'preflight/pacman\.sh' omarchy/install/preflight/all.sh
+          absent  'cachyos-release'      omarchy/install/preflight/guard.sh
+          absent  '^tldr$'               omarchy/install/omarchy-base.packages
+          absent  '^ln -s |ln -sffn'     omarchy/install/config/omarchy-ai-skill.sh
+          present 'ln -sfn'              omarchy/install/config/omarchy-ai-skill.sh
+          present 'wifi\.backend=iwd'    omarchy/install/config/hardware/network.sh
+          present 'CachyOS walker repo pin'  omarchy/install/config/walker-elephant.sh
+          present 'Minimal SDDM integration' omarchy/install/login/sddm.sh
+          present 'NVIDIA configuration for Omarchy on CachyOS' omarchy/install/config/hardware/nvidia.sh
+          echo "All post-state checks passed."

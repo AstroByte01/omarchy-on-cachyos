@@ -301,13 +301,30 @@ remove_run_logged() {
     local script_path="$2"
 
     if [ ! -f "$file" ]; then
-        echo "Warning: [disable $script_path] $file not found in this Omarchy ref; skipping."
-        return 0
+        echo "Error: [disable $script_path] $file is missing from this Omarchy ref."
+        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
+        echo "this adapter supports (see the CI badge in the README), or update the adapter."
+        exit 1
     fi
 
-    sed -i "\#run_logged .*$script_path#d" "$file"
-    verify_patch "disable $script_path" "$file" "run_logged .*$script_path" absent
+    # Delete any wiring of the script (run_logged or source), so a future
+    # upstream switch to 'source' cannot silently re-enable the step.
+    sed -i "\#$script_path#d" "$file"
+    verify_patch "disable $script_path" "$file" "$script_path" absent required
     record_patch "Disabled Omarchy install step: $script_path"
+}
+
+# Restore a file to its upstream state from the git checkout the fetch
+# produced. Used when a previous run applied an opt-in patch that the
+# current flags no longer want.
+restore_upstream_file() {
+    local file="$1" name="$2"
+
+    if ! git checkout -- "$file" 2>/dev/null; then
+        echo "Error: [$name] could not restore upstream $file (not a git checkout?)."
+        echo "Refetch Omarchy cleanly: re-run with OMARCHY_ON_EXISTING=replace or delete $OMARCHY_DIR."
+        exit 1
+    fi
 }
 
 patch_guard_for_cachyos() {
@@ -338,7 +355,13 @@ patch_network_script() {
     local network_file="install/config/hardware/network.sh"
 
     if [ "$ENABLE_IWD_BACKEND" != "1" ]; then
-        record_patch "Kept existing NetworkManager/wpa_supplicant behavior"
+        if [ -f "$network_file" ] && grep -q "CachyOS NetworkManager iwd backend" "$network_file"; then
+            restore_upstream_file "$network_file" "network iwd rollback"
+            verify_patch "network iwd rollback" "$network_file" "CachyOS NetworkManager iwd backend" absent required
+            record_patch "Removed previously added iwd backend block (keeping wpa_supplicant)"
+        else
+            record_patch "Kept existing NetworkManager/wpa_supplicant behavior"
+        fi
         return 0
     fi
 
@@ -382,7 +405,7 @@ patch_walker_script() {
 
     sed -i '2i\
 # CachyOS walker repo pin\
-if ! grep -Eq "^IgnorePkg = .*[[:space:]]walker([[:space:]]|$)" /etc/pacman.conf 2>/dev/null; then\
+if ! grep -Eq "^IgnorePkg = (.*[[:space:]])?walker([[:space:]]|$)" /etc/pacman.conf 2>/dev/null; then\
   if grep -q "^IgnorePkg =" /etc/pacman.conf 2>/dev/null; then\
     sudo sed -i '"'"'0,/^IgnorePkg = /s/^IgnorePkg = /IgnorePkg = walker /'"'"' /etc/pacman.conf\
   else\
@@ -400,7 +423,13 @@ patch_sddm_script() {
     local session_file="default/wayland-sessions/omarchy.desktop"
 
     if [ "$ENABLE_AUTOLOGIN" != "0" ]; then
-        record_patch "Autologin allowed: kept Omarchy's own SDDM autologin setup"
+        if [ -f "$sddm_file" ] && grep -q "Minimal SDDM integration" "$sddm_file"; then
+            restore_upstream_file "$sddm_file" "sddm autologin restore"
+            verify_patch "sddm autologin restore" "$sddm_file" "Minimal SDDM integration" absent required
+            record_patch "Restored Omarchy's own SDDM autologin setup (autologin allowed)"
+        else
+            record_patch "Autologin allowed: kept Omarchy's own SDDM autologin setup"
+        fi
         return 0
     fi
 

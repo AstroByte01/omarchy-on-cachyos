@@ -26,7 +26,7 @@ This script does not:
  1) Install CachyOS or any other Linux operating system
  2) Partition, format, or encrypt hard disks
  3) Install or configure a boot loader
- 4) Install or configure a login display manager
+ 4) Install or configure a login display manager, beyond the optional autologin/selectable-session integration described below
 
 All of the above need to be done when you install CachyOS. 
 

@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_TARGET="$(cd "$SCRIPT_DIR/.." && pwd)/omarchy"
-TARGET_DIR="${OMARCHY_DIR:-$DEFAULT_TARGET}"
+# Canonicalize so ../ segments cannot sneak a dangerous path past the
+# delete allowlist in resolve_existing_dir.
+TARGET_DIR="$(realpath -m -- "${OMARCHY_DIR:-$DEFAULT_TARGET}")"
 REPO_URL="https://github.com/basecamp/omarchy"
 
 REF="${OMARCHY_REF:-}"
@@ -72,6 +74,17 @@ resolve_existing_dir() {
 
     case "$decision" in
         keep)
+            if [ -n "$REF" ]; then
+                local current
+                current="$(git -C "$TARGET_DIR" describe --tags --exact-match 2>/dev/null \
+                    || git -C "$TARGET_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null \
+                    || echo unknown)"
+                if [ "$current" != "$REF" ]; then
+                    echo "Error: existing checkout at $TARGET_DIR is '$current' but --ref requested '$REF'."
+                    echo "Delete it, or re-run with --force / OMARCHY_ON_EXISTING=replace to fetch the requested version."
+                    exit 1
+                fi
+            fi
             echo "Proceeding with existing files in $TARGET_DIR."
             exit 0
             ;;
