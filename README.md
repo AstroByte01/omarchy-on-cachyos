@@ -1,6 +1,6 @@
 # omarchy-on-cachyos
 
-[![CI](https://github.com/th3rig/omarchy-on-cachyos/actions/workflows/ci.yml/badge.svg)](https://github.com/th3rig/omarchy-on-cachyos/actions/workflows/ci.yml)
+[![CI](https://github.com/AstroByte01/omarchy-on-cachyos/actions/workflows/ci.yml/badge.svg)](https://github.com/AstroByte01/omarchy-on-cachyos/actions/workflows/ci.yml)
 
 Based on [mroboff/omarchy-on-cachyos](https://github.com/mroboff/omarchy-on-cachyos) (MIT); this is an independently maintained continuation.
 
@@ -101,7 +101,7 @@ Other configuration changes are up to you. Note, however, that this script has n
 
 ```bash
 # Clone the repository
-git clone https://github.com/th3rig/omarchy-on-cachyos.git
+git clone https://github.com/AstroByte01/omarchy-on-cachyos.git
 
 # Navigate to the project directory
 cd omarchy-on-cachyos
