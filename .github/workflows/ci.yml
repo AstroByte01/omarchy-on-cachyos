@@ -16,12 +16,25 @@ jobs:
       - name: shellcheck
         run: shellcheck --severity=warning bin/*.sh tests/*.sh
 
-  package-metadata:
+  cachyos-package-compatibility:
     runs-on: ubuntu-latest
     container: archlinux:base
     defaults:
       run:
         shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: cachyos-extra-v3
+            repo_path: x86_64_v3
+          - repo: cachyos-extra-v4
+            repo_path: x86_64_v4
+          - repo: cachyos-extra-znver4
+            repo_path: x86_64_v4
+    env:
+      CACHYOS_REPO: ${{ matrix.repo }}
+      CACHYOS_REPO_PATH: ${{ matrix.repo_path }}
     steps:
       - name: Install tooling
         run: |
@@ -30,21 +43,24 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - name: Exercise isolated pacman metadata refresh
+      - name: Configure isolated CachyOS metadata source
+        run: |
+          cat > /tmp/cachyos-pacman.conf <<EOF
+          [options]
+          Architecture = x86_64
+          SigLevel = Never
+
+          [$CACHYOS_REPO]
+          Server = https://cdn77.cachyos.org/repo/$CACHYOS_REPO_PATH/\$repo
+          EOF
+
+      - name: Reject unverified Hyprland/Aquamarine drift
         run: |
           set -euo pipefail
           source ./bin/install-omarchy-on-cachyos.sh
-          sync_db=$(create_fresh_sync_db)
-          trap 'cleanup_fresh_sync_db "$sync_db"' EXIT
-
-          hypr_info=$(first_sync_package_info hyprland "$sync_db")
-          aqua_info=$(first_sync_package_info aquamarine "$sync_db")
-          hypr_dep=$(package_info_soname "$hypr_info" "Depends On" libaquamarine.so)
-          aqua_provides=$(package_info_soname "$aqua_info" Provides libaquamarine.so)
-          [ "$hypr_dep" = "$aqua_provides" ]
-
-          cleanup_fresh_sync_db "$sync_db"
-          trap - EXIT
+          PACMAN_CONF_PATH=/tmp/cachyos-pacman.conf
+          is_cachyos() { return 0; }
+          check_fresh_hyprland_aquamarine_alignment
 
   refs:
     # Mirrors the fetch menu: the 5 newest upstream tags, plus the dev branch.

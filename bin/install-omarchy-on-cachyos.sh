@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -9,14 +9,25 @@ OMARCHY_KEY_FINGERPRINT="40DFB630FF42BCFFB047046CF0134EE680CAC571"
 OMARCHY_KEY_ID="F0134EE680CAC571"
 OMARCHY_REPO_SERVER='https://pkgs.omarchy.org/$arch'
 PACMAN_CONF_PATH="/etc/pacman.conf"
+COMPATIBILITY_FILE="$REPO_DIR/config/hyprland-aquamarine-compatibility.tsv"
+SNAPPER_CONFIG="root"
 
 DRY_RUN=0
 PREPARE_ONLY=0
+INSTALL_MODE="production"
+ALLOW_UNVERIFIED_PACKAGE_PAIR=0
+ALLOW_NO_SNAPSHOT=0
 ENABLE_AUTOLOGIN=""
 ENABLE_IWD_BACKEND=""
 OMARCHY_REF="${OMARCHY_REF:-}"
 OMARCHY_PROFILE="${OMARCHY_PROFILE:-upstream}"
 APPLIED_PATCHES=()
+EXPECTED_HYPRLAND_VERSION=""
+EXPECTED_AQUAMARINE_VERSION=""
+EXPECTED_HYPRLAND_REPOSITORY=""
+SNAPPER_PRE_NUMBER=""
+SNAPPER_POST_NUMBER=""
+SNAPSHOT_RECOVERY_NOTICE_SHOWN=0
 
 export OMARCHY_DIR
 
@@ -32,6 +43,11 @@ Options:
   --profile <name>      Apply an optional customization profile after CachyOS
                         patches. Supported: upstream, th3rig.
                         Also honored from the OMARCHY_PROFILE environment variable.
+  --staging-allow-unverified-pair
+                        Mark this run as staging and allow a Hyprland/Aquamarine
+                        pair that is not in the verified compatibility list.
+  --allow-no-snapshot   Continue if a root BTRFS/Snapper snapshot cannot be made.
+                        Full production installs require a snapshot by default.
   --auto-login          Allow Omarchy to configure SDDM autologin.
   --no-auto-login       Keep the existing display-manager login flow.
   --network-iwd         Configure NetworkManager to use iwd and disable wpa_supplicant.
@@ -64,6 +80,13 @@ parse_args() {
                 fi
                 OMARCHY_PROFILE="$2"
                 shift
+                ;;
+            --staging-allow-unverified-pair)
+                INSTALL_MODE="staging"
+                ALLOW_UNVERIFIED_PACKAGE_PAIR=1
+                ;;
+            --allow-no-snapshot)
+                ALLOW_NO_SNAPSHOT=1
                 ;;
             --auto-login)
                 ENABLE_AUTOLOGIN=1
@@ -225,6 +248,12 @@ print_preflight() {
     echo "  Display manager   : $display_manager"
     echo "  NVIDIA GPU        : $nvidia"
     echo "  Profile           : $OMARCHY_PROFILE"
+    echo "  Install mode      : $INSTALL_MODE"
+    if [ "$ALLOW_NO_SNAPSHOT" = "1" ]; then
+        echo "  Snapshot policy   : exception allowed"
+    else
+        echo "  Snapshot policy   : required"
+    fi
     echo "  Omarchy workdir   : $OMARCHY_DIR"
     echo "  Install target    : $OMARCHY_INSTALL_DIR"
     echo ""
@@ -255,18 +284,20 @@ print_dry_run() {
     echo "     pin walker, and optionally configure iwd and a selectable SDDM session."
     echo "  4. Apply the selected profile overlay: $OMARCHY_PROFILE."
     echo "  5. Verify every patch after applying it, aborting if upstream Omarchy has drifted."
-    echo "  6. Refresh isolated package metadata and verify Hyprland/Aquamarine alignment."
-    echo "  7. Install yay only if missing, using a temporary build directory."
-    echo "  8. Import and locally sign Omarchy package key: $OMARCHY_KEY_ID"
-    echo "  9. Validate or add the signature-required Omarchy pacman repository."
-    echo " 10. Sync pacman once, recheck the exact transaction metadata, then update."
-    echo " 11. Backup /etc/sddm.conf before removing it, only when autologin is enabled."
-    echo " 12. Copy patched Omarchy files to: $OMARCHY_INSTALL_DIR"
-    echo " 13. Run Omarchy's patched install.sh unless --prepare-only is used."
+    echo "  6. Refresh isolated package metadata and require a verified Hyprland/Aquamarine pair."
+    echo "  7. Create a required root Snapper snapshot and print recovery instructions."
+    echo "  8. Install yay only if missing, using a temporary build directory."
+    echo "  9. Import and locally sign Omarchy package key: $OMARCHY_KEY_ID"
+    echo " 10. Validate or add the signature-required Omarchy pacman repository."
+    echo " 11. Sync pacman once, recheck the exact transaction metadata, then update."
+    echo " 12. Backup /etc/sddm.conf before removing it, only when autologin is enabled."
+    echo " 13. Copy patched Omarchy files to: $OMARCHY_INSTALL_DIR"
+    echo " 14. Run Omarchy's patched install.sh unless --prepare-only is used."
+    echo " 15. Verify installed versions, dynamic links, and Hyprland --version."
 }
 
 ensure_tooling() {
-    for cmd in curl fakeroot git pacman pacman-conf realpath sudo; do
+    for cmd in curl fakeroot findmnt git ldd pacman pacman-conf realpath sudo; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo "Error: $cmd is required before running this script."
             exit 1
@@ -278,6 +309,7 @@ first_sync_package_info() {
     local package="$1" sync_db_path="${2:-}"
     local -a pacman_args=()
 
+    pacman_args+=(--config "$PACMAN_CONF_PATH")
     if [ -n "$sync_db_path" ]; then
         pacman_args+=(--dbpath "$sync_db_path")
     fi
@@ -385,7 +417,7 @@ create_fresh_sync_db() {
     done
 
     sync_db_path="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-pacman-db.XXXXXX")"
-    system_db_path="$(pacman-conf DBPath)"
+    system_db_path="$(pacman-conf -c "$PACMAN_CONF_PATH" DBPath)"
 
     if [ ! -d "$system_db_path/local" ]; then
         echo "Error: pacman's installed-package database is missing: $system_db_path/local" >&2
@@ -396,7 +428,7 @@ create_fresh_sync_db() {
     ln -s "$system_db_path/local" "$sync_db_path/local"
 
     echo "Refreshing package metadata in an isolated temporary database..." >&2
-    if ! LC_ALL=C fakeroot -- pacman -Sy --noconfirm --disable-sandbox-filesystem \
+    if ! LC_ALL=C fakeroot -- pacman --config "$PACMAN_CONF_PATH" -Sy --noconfirm --disable-sandbox-filesystem \
         --dbpath "$sync_db_path" --logfile /dev/null >&2; then
         echo "Error: Could not refresh temporary pacman databases; package alignment was not verified." >&2
         cleanup_fresh_sync_db "$sync_db_path"
@@ -404,6 +436,65 @@ create_fresh_sync_db() {
     fi
 
     printf '%s\n' "$sync_db_path"
+}
+
+validate_compatibility_manifest() {
+    local manifest="${1:-$COMPATIBILITY_FILE}"
+
+    if [ ! -r "$manifest" ]; then
+        echo "Error: Hyprland/Aquamarine compatibility manifest is missing or unreadable: $manifest"
+        return 1
+    fi
+
+    awk -F '\t' '
+        /^[[:space:]]*(#|$)/ { next }
+        NF != 4 {
+            printf "Error: malformed compatibility entry at %s:%d\n", FILENAME, NR > "/dev/stderr"
+            invalid = 1
+            next
+        }
+        $1 ~ /[[:space:]]/ || $2 ~ /[[:space:]]/ || $3 !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ || $4 == "" {
+            printf "Error: invalid compatibility fields at %s:%d\n", FILENAME, NR > "/dev/stderr"
+            invalid = 1
+        }
+        seen[$1 SUBSEP $2]++ {
+            printf "Error: duplicate compatibility pair at %s:%d\n", FILENAME, NR > "/dev/stderr"
+            invalid = 1
+        }
+        END { exit invalid ? 1 : 0 }
+    ' "$manifest"
+}
+
+compatibility_manifest_has_pair() {
+    local hyprland_version="$1" aquamarine_version="$2"
+
+    awk -F '\t' -v hyprland="$hyprland_version" -v aquamarine="$aquamarine_version" '
+        /^[[:space:]]*(#|$)/ { next }
+        $1 == hyprland && $2 == aquamarine { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$COMPATIBILITY_FILE"
+}
+
+enforce_verified_package_pair() {
+    local hyprland_version="$1" aquamarine_version="$2"
+
+    validate_compatibility_manifest || return 1
+
+    if compatibility_manifest_has_pair "$hyprland_version" "$aquamarine_version"; then
+        echo "Verified compatibility pair: hyprland $hyprland_version / aquamarine $aquamarine_version"
+        return 0
+    fi
+
+    if [ "$INSTALL_MODE" = "staging" ] && [ "$ALLOW_UNVERIFIED_PACKAGE_PAIR" = "1" ]; then
+        echo "Warning: STAGING override accepts unverified pair: hyprland $hyprland_version / aquamarine $aquamarine_version"
+        echo "Do not use this result as production approval."
+        return 0
+    fi
+
+    echo "Error: hyprland $hyprland_version / aquamarine $aquamarine_version is not in the verified compatibility list."
+    echo "Validate the pair in a disposable CachyOS environment before adding it to $COMPATIBILITY_FILE."
+    echo "For staging only, use --staging-allow-unverified-pair."
+    return 1
 }
 
 check_hyprland_aquamarine_alignment() {
@@ -467,6 +558,12 @@ check_hyprland_aquamarine_alignment() {
         return 1
     fi
 
+    enforce_verified_package_pair "$hypr_version" "$aqua_version" || return 1
+
+    EXPECTED_HYPRLAND_VERSION="$hypr_version"
+    EXPECTED_AQUAMARINE_VERSION="$aqua_version"
+    EXPECTED_HYPRLAND_REPOSITORY="$hypr_repo"
+
     return 0
 }
 
@@ -485,6 +582,247 @@ check_fresh_hyprland_aquamarine_alignment() {
 
     cleanup_fresh_sync_db "$sync_db_path" || return 1
     return "$status"
+}
+
+root_filesystem_type() {
+    findmnt -n -o FSTYPE / 2>/dev/null
+}
+
+snapper_root_config_exists() {
+    command -v snapper >/dev/null 2>&1 || return 1
+
+    LC_ALL=C snapper --csvout --no-headers list-configs --columns config,subvolume 2>/dev/null |
+        awk -F, -v config="$SNAPPER_CONFIG" '$1 == config && $2 == "/" { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+check_snapshot_readiness() {
+    local root_fs
+
+    root_fs="$(root_filesystem_type || true)"
+    if [ "$root_fs" != "btrfs" ]; then
+        echo "Error: root filesystem is '${root_fs:-unknown}', not BTRFS; a Snapper rollback snapshot cannot be created."
+        return 1
+    fi
+
+    if ! command -v snapper >/dev/null 2>&1; then
+        echo "Error: snapper is not installed; a production rollback snapshot is required."
+        return 1
+    fi
+
+    if ! snapper_root_config_exists; then
+        echo "Error: Snapper config '$SNAPPER_CONFIG' for / is missing or inaccessible."
+        return 1
+    fi
+
+    return 0
+}
+
+enforce_snapshot_policy() {
+    if check_snapshot_readiness; then
+        echo "Snapshot readiness: BTRFS root with Snapper config '$SNAPPER_CONFIG'."
+        return 0
+    fi
+
+    if [ "$ALLOW_NO_SNAPSHOT" = "1" ]; then
+        echo "Warning: continuing without a rollback snapshot because --allow-no-snapshot was explicitly provided."
+        return 0
+    fi
+
+    echo "Refusing to continue without rollback protection."
+    echo "Configure BTRFS/Snapper or explicitly use --allow-no-snapshot."
+    return 1
+}
+
+print_snapshot_recovery_command() {
+    local bootloader
+
+    [ -n "$SNAPPER_PRE_NUMBER" ] || return 0
+
+    bootloader="$(detected_bootloader)"
+    echo "Recovery instructions for pre-install root snapshot $SNAPPER_PRE_NUMBER:"
+    case "$bootloader" in
+        grub)
+            echo "  1. Reboot and select snapshot $SNAPPER_PRE_NUMBER from GRUB's snapshots submenu."
+            echo "  2. After booting that snapshot, run: sudo -E btrfs-assistant"
+            echo "  3. Open Snapper > Browse/Restore, select snapshot $SNAPPER_PRE_NUMBER, and choose Restore."
+            ;;
+        limine)
+            echo "  1. Reboot and select snapshot $SNAPPER_PRE_NUMBER from Limine's Snapshots menu."
+            echo "  2. Use CachyOS's Restore now prompt and choose the replace method."
+            ;;
+        *)
+            echo "  Inspect it with: sudo snapper -c $SNAPPER_CONFIG status $SNAPPER_PRE_NUMBER..0"
+            echo "  Restore it with the snapshot workflow supported by the active bootloader."
+            ;;
+    esac
+    echo "  Snapper CLI fallback (only when default-subvolume rollback is configured):"
+    echo "    sudo snapper -c $SNAPPER_CONFIG rollback $SNAPPER_PRE_NUMBER && sudo reboot"
+}
+
+detected_bootloader() {
+    local boot_status
+
+    boot_status="$(bootctl status 2>/dev/null || true)"
+    if grep -qiE 'Product:[[:space:]]*GRUB' <<< "$boot_status"; then
+        echo grub
+    elif grep -qiE 'Product:[[:space:]]*Limine' <<< "$boot_status"; then
+        echo limine
+    else
+        echo unknown
+    fi
+}
+
+create_preinstall_snapshot() {
+    local description snapshot_output
+
+    if ! check_snapshot_readiness; then
+        if [ "$ALLOW_NO_SNAPSHOT" = "1" ]; then
+            echo "Warning: continuing without a rollback snapshot because --allow-no-snapshot was explicitly provided."
+            return 0
+        fi
+        echo "Refusing to modify the system without a rollback snapshot."
+        return 1
+    fi
+
+    description="Before Omarchy on CachyOS (${OMARCHY_REF:-selected ref}, profile $OMARCHY_PROFILE)"
+    if ! snapshot_output="$(sudo snapper -c "$SNAPPER_CONFIG" create --type pre --print-number \
+        --cleanup-algorithm number --userdata important=yes --description "$description")"; then
+        if [ "$ALLOW_NO_SNAPSHOT" = "1" ]; then
+            echo "Warning: Snapper could not create the pre-install snapshot; continuing due to --allow-no-snapshot."
+            return 0
+        fi
+        echo "Error: Snapper could not create the required pre-install snapshot."
+        return 1
+    fi
+
+    SNAPPER_PRE_NUMBER="$(awk '/^[0-9]+$/ { number = $0 } END { print number }' <<< "$snapshot_output")"
+    if [[ ! "$SNAPPER_PRE_NUMBER" =~ ^[0-9]+$ ]]; then
+        echo "Error: Snapper created a snapshot but did not return a valid snapshot number."
+        return 1
+    fi
+
+    echo "Created pre-install root snapshot: $SNAPPER_PRE_NUMBER"
+    print_snapshot_recovery_command
+}
+
+create_postinstall_snapshot() {
+    local description snapshot_output
+
+    [ -n "$SNAPPER_PRE_NUMBER" ] || return 0
+
+    description="After Omarchy on CachyOS (${OMARCHY_REF:-selected ref}, profile $OMARCHY_PROFILE)"
+    if ! snapshot_output="$(sudo snapper -c "$SNAPPER_CONFIG" create --type post \
+        --pre-number "$SNAPPER_PRE_NUMBER" --print-number --cleanup-algorithm number \
+        --userdata important=yes --description "$description")"; then
+        echo "Error: Snapper could not close the pre/post installation snapshot pair."
+        return 1
+    fi
+
+    SNAPPER_POST_NUMBER="$(awk '/^[0-9]+$/ { number = $0 } END { print number }' <<< "$snapshot_output")"
+    if [[ ! "$SNAPPER_POST_NUMBER" =~ ^[0-9]+$ ]]; then
+        echo "Error: Snapper did not return a valid post-install snapshot number."
+        return 1
+    fi
+
+    echo "Created post-install root snapshot: $SNAPPER_POST_NUMBER (pre: $SNAPPER_PRE_NUMBER)"
+}
+
+handle_install_failure() {
+    local status=$?
+
+    trap - ERR INT TERM
+    if [ "$SNAPSHOT_RECOVERY_NOTICE_SHOWN" != "1" ]; then
+        SNAPSHOT_RECOVERY_NOTICE_SHOWN=1
+        echo ""
+        echo "Installation stopped after the rollback snapshot was created."
+        print_snapshot_recovery_command
+    fi
+    exit "$status"
+}
+
+handle_install_interrupt() {
+    local status="$1"
+
+    trap - ERR INT TERM
+    echo ""
+    echo "Installation interrupted after the rollback snapshot was created."
+    print_snapshot_recovery_command
+    exit "$status"
+}
+
+arm_snapshot_recovery_traps() {
+    [ -n "$SNAPPER_PRE_NUMBER" ] || return 0
+
+    trap handle_install_failure ERR
+    trap 'handle_install_interrupt 130' INT
+    trap 'handle_install_interrupt 143' TERM
+}
+
+disarm_snapshot_recovery_traps() {
+    trap - ERR INT TERM
+}
+
+hyprland_binary_path() {
+    command -v Hyprland
+}
+
+dynamic_link_report() {
+    LC_ALL=C ldd "$1" 2>&1
+}
+
+run_hyprland_version() {
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$1" --version 2>&1
+}
+
+validate_post_install_hyprland() {
+    local installed_hypr installed_aqua binary link_report version_output
+
+    is_cachyos || return 0
+
+    if [ -z "$EXPECTED_HYPRLAND_VERSION" ] || [ -z "$EXPECTED_AQUAMARINE_VERSION" ]; then
+        echo "Error: expected Hyprland/Aquamarine versions were not retained from the checked transaction."
+        return 1
+    fi
+
+    installed_hypr="$(installed_package_version hyprland)"
+    installed_aqua="$(installed_package_version aquamarine)"
+    if [ "$installed_hypr" != "$EXPECTED_HYPRLAND_VERSION" ] || [ "$installed_aqua" != "$EXPECTED_AQUAMARINE_VERSION" ]; then
+        echo "Error: installed Hyprland/Aquamarine versions differ from the verified transaction."
+        echo "  expected: hyprland $EXPECTED_HYPRLAND_VERSION / aquamarine $EXPECTED_AQUAMARINE_VERSION"
+        echo "  installed: hyprland ${installed_hypr:-missing} / aquamarine ${installed_aqua:-missing}"
+        return 1
+    fi
+
+    if ! binary="$(hyprland_binary_path)" || [ -z "$binary" ]; then
+        echo "Error: Hyprland was not found after Omarchy installation."
+        return 1
+    fi
+
+    if ! link_report="$(dynamic_link_report "$binary")"; then
+        echo "Error: ldd could not inspect the installed Hyprland binary."
+        echo "$link_report"
+        return 1
+    fi
+    if grep -qE '(^|[[:space:]])not found($|[[:space:]])' <<< "$link_report"; then
+        echo "Error: Hyprland has unresolved dynamic libraries:"
+        grep -E '(^|[[:space:]])not found($|[[:space:]])' <<< "$link_report"
+        return 1
+    fi
+    if ! grep -q 'libaquamarine\.so' <<< "$link_report"; then
+        echo "Error: Hyprland's dynamic-link report does not include libaquamarine.so."
+        return 1
+    fi
+
+    if ! version_output="$(run_hyprland_version "$binary")"; then
+        echo "Error: Hyprland --version failed after installation."
+        echo "$version_output"
+        return 1
+    fi
+
+    echo "Post-install Hyprland validation passed."
+    echo "  installed pair : hyprland $installed_hypr / aquamarine $installed_aqua"
+    echo "  repository     : $EXPECTED_HYPRLAND_REPOSITORY"
+    echo "  version probe  : $(head -n 1 <<< "$version_output")"
 }
 
 fetch_omarchy() {
@@ -1136,6 +1474,11 @@ print_applied_patches() {
 print_install_summary() {
     print_applied_patches
 
+    if [ -n "$SNAPPER_PRE_NUMBER" ]; then
+        echo ""
+        print_snapshot_recovery_command
+    fi
+
     if [ "$ENABLE_AUTOLOGIN" = "1" ]; then
         echo ""
         echo "Autologin is enabled; /etc/sddm.conf was backed up first if present."
@@ -1156,6 +1499,8 @@ main() {
             check_fresh_hyprland_aquamarine_alignment
             echo ""
         fi
+        enforce_snapshot_policy
+        echo ""
         print_dry_run
         exit 0
     fi
@@ -1193,6 +1538,8 @@ main() {
     fi
 
     check_fresh_hyprland_aquamarine_alignment
+    create_preinstall_snapshot
+    arm_snapshot_recovery_traps
     install_yay_if_missing
     setup_omarchy_repo
     backup_sddm_conf_for_autologin
@@ -1202,6 +1549,9 @@ main() {
     print_install_summary
     chmod +x install.sh
     ./install.sh
+    validate_post_install_hyprland
+    create_postinstall_snapshot
+    disarm_snapshot_recovery_traps
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

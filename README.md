@@ -4,6 +4,7 @@
 
 Based on [mroboff/omarchy-on-cachyos](https://github.com/mroboff/omarchy-on-cachyos) (MIT); this is an independently maintained continuation.
 
+- UPDATE 19-Jul-2026 (production gates): Production installs now require an approved Hyprland/Aquamarine version pair and a root BTRFS/Snapper snapshot. CI watches the CachyOS v3, v4, and znver4 repositories for unapproved package drift. After Omarchy finishes, the adapter verifies the installed package versions, checks `ldd` for unresolved libraries, and runs `Hyprland --version` before closing the Snapper pre/post pair.
 - UPDATE 19-Jul-2026 (production hardening): The mkinitcpio repair now returns safely to Omarchy's sourced post-install flow and never overwrites an active hook. Hyprland/Aquamarine compatibility is checked against freshly synchronized temporary metadata and checked again against the exact system databases used for the upgrade. Existing profile overlays can be rolled back to `upstream`, and the Omarchy repository now requires trusted package signatures while allowing its unsigned database.
 - UPDATE 19-Jul-2026: Re-verified all compatibility patches (mise `--shims` activation, `omarchy-update-restart` kernel detection, guard relaxations) against the current Omarchy release; no drift found. Added a CachyOS-side mitigation for upstream Omarchy issue #6188: the adapter now keeps mkinitcpio pacman hooks active during package installation and adds a post-install repair for stranded `.hook.disabled` files before reboot. Also added an opt-in `--profile th3rig` overlay for local application defaults, starting with Ghostty as the preferred terminal and the upstream terminal as the fallback.
 - UPDATE 12-Jul-2026: Every compatibility patch is now verified after applying (the installer aborts if upstream Omarchy drifts), Omarchy's hibernation setup is disabled on CachyOS, non-interactive version selection via `--ref`, and CI tests every supported Omarchy release weekly. Also: dry-run, prepare-only, safer defaults, SDDM backup, optional autologin, and optional NetworkManager/iwd changes.
@@ -60,7 +61,7 @@ The philosophy behind this script is to produce a strong and stable blend of Cac
 
 IMPORTANT: This script does not install CachyOS. You must do that separately (and first.) This script is intended to be run on a fresh installation of CachyOS with the following configuration choices made: (Note, for information on installing CachyOS, please refer to https://www.cachyos.org.) 
 
-1. File System: BTRFS with Snapper is still recommended. This adapter disables Omarchy bootloader/snapshot scripts that conflict with CachyOS, so the installer preflight treats non-BTRFS as a warning rather than a hard adapter failure.
+1. File System: A full production install requires a BTRFS root with a Snapper config named `root`. The adapter creates a root pre-install snapshot before its first package/system change and a linked post-install snapshot after validation. A non-BTRFS or unconfigured system stops unless `--allow-no-snapshot` is supplied explicitly. The root snapshot protects package and system configuration changes; it does not roll back files on a separate `/home` subvolume.
 
 2. Shell: You must choose Fish as the default shell for this installation script to work properly. (This is the default CachyOS shell choice.)
 
@@ -131,6 +132,8 @@ cd omarchy-on-cachyos
 - `--prepare-only`: fetches Omarchy and applies compatibility patches, then stops before sudo system setup, `pacman`, copying to `~/.local/share/omarchy`, or running `install.sh`. Does not prompt for name/email (those are only used by the full install).
 - `--ref <tag|branch>`: fetches that Omarchy version without showing the interactive menu (for example `--ref v3.8.2` or `--ref dev`). Also honored from the `OMARCHY_REF` environment variable.
 - `--profile <upstream|th3rig>`: applies an optional local customization overlay after the CachyOS compatibility patches. The default is `upstream`, which keeps Omarchy's application defaults. `th3rig` currently installs Ghostty and makes it the preferred terminal, while keeping the selected Omarchy release's original terminal as the fallback. Also honored from the `OMARCHY_PROFILE` environment variable.
+- `--staging-allow-unverified-pair`: marks the run as staging and permits a Hyprland/Aquamarine pair that is not yet listed in `config/hyprland-aquamarine-compatibility.tsv`. This exception must not be used to approve or deploy a production system.
+- `--allow-no-snapshot`: allows a full install to continue only when the required root Snapper snapshot is unavailable or cannot be created. Without this explicit exception, the installer fails closed before its first system change.
 - `--auto-login`: allows Omarchy to configure SDDM autologin. If `/etc/sddm.conf` exists, it is backed up before removal.
 - `--no-auto-login`: keeps the existing display-manager flow, including CachyOS `plasmalogin`, and installs Omarchy as a selectable Wayland session when supported by the display manager.
 - `--network-iwd`: adds a CachyOS compatibility block that disables `wpa_supplicant` and writes `/etc/NetworkManager/conf.d/omarchy-iwd.conf`.
@@ -158,13 +161,28 @@ Profiles are opt-in overlays for choices that are personal rather than strictly 
 
 The adapter removes Omarchy's manual-install mkinitcpio hook disable step on CachyOS. This avoids upstream issue [#6188](https://github.com/basecamp/omarchy/issues/6188), where a manual install can leave `/boot` stale on GRUB systems if kernel packages change while mkinitcpio pacman hooks are disabled. The adapter also wires a post-install repair script that restores a stranded `60-mkinitcpio-remove.hook.disabled` or `90-mkinitcpio-install.hook.disabled` only when its active hook is missing, then regenerates initramfs before the install finishes. If both copies exist, the active hook wins and the older disabled copy is left untouched for manual inspection.
 
-For upstream issue [#6224](https://github.com/basecamp/omarchy/issues/6224), the adapter does not pin Hyprland/Aquamarine versions. During `--dry-run` and before a full install, it synchronizes an isolated temporary pacman database and requires `hyprland` and `aquamarine` to resolve from the same CachyOS repo with matching required/provided `libaquamarine.so` sonames. During the full install it synchronizes the system database once, repeats the check against that exact database, and then upgrades with `pacman -Su` so no second refresh can change the checked package set. Missing or unparseable metadata fails closed.
+For upstream issue [#6224](https://github.com/basecamp/omarchy/issues/6224), the adapter does not pin Hyprland/Aquamarine versions. During `--dry-run` and before a full install, it synchronizes an isolated temporary pacman database and requires `hyprland` and `aquamarine` to resolve from the same CachyOS repo with matching required/provided `libaquamarine.so` sonames. The exact version pair must also appear in `config/hyprland-aquamarine-compatibility.tsv`; a new pair fails closed even when its SONAME still matches. `--staging-allow-unverified-pair` is the only bypass and labels the run as staging. During the full install the adapter synchronizes the system database once, repeats all checks against that exact database, and then upgrades with `pacman -Su` so no second refresh can change the checked package set.
+
+Immediately before the first package change, the adapter creates a numbered Snapper pre-snapshot and prints bootloader-specific recovery instructions. On CachyOS with GRUB, the supported path is to boot the numbered snapshot from GRUB's snapshots submenu and then launch the restore UI with:
+
+```bash
+sudo -E btrfs-assistant
+```
+
+The output also includes the exact numbered `snapper rollback` command as a fallback, explicitly limited to systems configured to boot Snapper's default subvolume; CachyOS GRUB installations commonly use an explicit `subvol=@` and should use the boot-menu/Btrfs Assistant workflow instead. If a later command fails or the installation is interrupted, the instructions are printed again. After Omarchy finishes, the adapter requires the installed Hyprland/Aquamarine versions to equal the checked pair, rejects unresolved `ldd` entries, confirms that Hyprland links to Aquamarine, and runs `Hyprland --version`. Only then does it create the linked post-snapshot.
 
 The `[omarchy]` repository is accepted only at `https://pkgs.omarchy.org/$arch` and uses `SigLevel = Required DatabaseOptional TrustedOnly`: packages must carry a signature from the trusted Omarchy key, while the currently unsigned repository database remains allowed. Existing adapter-created `Optional TrustedOnly` configuration is migrated automatically; unexpected servers or ambiguous duplicate signature directives stop the installer.
 
+When CI reports a new Hyprland/Aquamarine pair, approve it with this sequence:
+
+1. Run the installer in a disposable CachyOS VM with `--staging-allow-unverified-pair`.
+2. Complete the post-install validation, reboot, log in to Hyprland, and exercise the session.
+3. Add the exact versions, verification date, and evidence to `config/hyprland-aquamarine-compatibility.tsv`.
+4. Re-run CI without the staging exception. Production remains blocked until the manifest change is merged.
+
 ### Supported Omarchy versions
 
-The version menu offers the five newest upstream release tags plus Bleeding Edge (upstream's `dev` branch). CI runs the patching step against all of them weekly — the supported versions are exactly the ones the CI badge is green for. Every patch is verified after it is applied, so if upstream Omarchy changes in a way this adapter doesn't expect, the installer stops with the name of the failed patch instead of continuing with a half-patched tree.
+The version menu offers the five newest upstream release tags plus Bleeding Edge (upstream's `dev` branch). CI runs the patching step against all of them weekly — the supported versions are exactly the ones the CI badge is green for. A separate scheduled matrix reads the live CachyOS v3, v4, and znver4 package databases and fails as soon as any repository publishes a Hyprland/Aquamarine pair absent from the compatibility manifest. Every patch is verified after it is applied, so if upstream Omarchy changes in a way this adapter doesn't expect, the installer stops with the name of the failed patch instead of continuing with a half-patched tree.
 
 ## 6. Statement of Lack of Warranty
 

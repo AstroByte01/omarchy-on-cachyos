@@ -24,7 +24,7 @@ assert_equal() {
 assert_contains() {
     local needle="$1" haystack="$2" message="$3"
 
-    grep -qF "$needle" <<< "$haystack" || fail "$message"
+    grep -qF -- "$needle" <<< "$haystack" || fail "$message"
 }
 
 # Sourcing exposes pure helpers without executing main.
@@ -46,6 +46,7 @@ assert_equal \
 
 if ! (
     is_cachyos() { return 0; }
+    enforce_verified_package_pair() { return 0; }
     pacman() {
         case "$*" in
             *"-Si hyprland")
@@ -91,6 +92,194 @@ cleanup() {
     esac
 }
 trap cleanup EXIT
+
+validate_compatibility_manifest >/dev/null || fail "repository compatibility manifest must be valid"
+compatibility_manifest_has_pair "0.55.4-1.1" "0.12.1-1.1" ||
+    fail "current verified CachyOS package pair must be present"
+
+test_manifest="$test_root/compatibility.tsv"
+printf '%s\t%s\t%s\t%s\n' \
+    "1.0.0-1" "2.0.0-1" "2026-07-19" "test evidence" > "$test_manifest"
+
+if ! (
+    COMPATIBILITY_FILE="$test_manifest"
+    INSTALL_MODE="production"
+    ALLOW_UNVERIFIED_PACKAGE_PAIR=0
+    enforce_verified_package_pair "1.0.0-1" "2.0.0-1" >/dev/null
+); then
+    fail "a manifest-listed package pair must pass in production"
+fi
+
+if (
+    COMPATIBILITY_FILE="$test_manifest"
+    INSTALL_MODE="production"
+    ALLOW_UNVERIFIED_PACKAGE_PAIR=0
+    enforce_verified_package_pair "1.0.1-1" "2.0.0-1" >/dev/null 2>&1
+); then
+    fail "an unverified package pair must fail closed in production"
+fi
+
+if (
+    COMPATIBILITY_FILE="$test_root/does-not-exist.tsv"
+    INSTALL_MODE="staging"
+    ALLOW_UNVERIFIED_PACKAGE_PAIR=1
+    enforce_verified_package_pair "1.0.1-1" "2.0.0-1" >/dev/null 2>&1
+); then
+    fail "staging must not bypass a missing compatibility manifest"
+fi
+
+if ! (
+    COMPATIBILITY_FILE="$test_manifest"
+    INSTALL_MODE="staging"
+    ALLOW_UNVERIFIED_PACKAGE_PAIR=1
+    enforce_verified_package_pair "1.0.1-1" "2.0.0-1" >/dev/null
+); then
+    fail "the explicit staging option must allow an unverified pair"
+fi
+
+malformed_manifest="$test_root/compatibility-malformed.tsv"
+printf '%s\n' '1.0.0-1 2.0.0-1 missing-tabs' > "$malformed_manifest"
+if (
+    export COMPATIBILITY_FILE="$malformed_manifest"
+    INSTALL_MODE="staging"
+    ALLOW_UNVERIFIED_PACKAGE_PAIR=1
+    enforce_verified_package_pair "1.0.0-1" "2.0.0-1" >/dev/null 2>&1
+); then
+    fail "staging must not bypass a malformed compatibility manifest"
+fi
+
+if ! (
+    INSTALL_MODE="production"
+    ALLOW_UNVERIFIED_PACKAGE_PAIR=0
+    parse_args --staging-allow-unverified-pair
+    assert_equal "staging" "$INSTALL_MODE" "staging option must mark the run as staging"
+    assert_equal "1" "$ALLOW_UNVERIFIED_PACKAGE_PAIR" "staging option must enable the unverified-pair exception"
+); then
+    fail "staging option parsing should succeed"
+fi
+
+snapshot_log="$test_root/snapshot.log"
+snapshot_output="$test_root/snapshot-output.log"
+if ! (
+    root_filesystem_type() { echo btrfs; }
+    snapper_root_config_exists() { return 0; }
+    sudo() {
+        printf '%s\n' "$*" >> "$snapshot_log"
+        case "$*" in
+            *"--type pre"*) printf '%s\n' 42 ;;
+            *"--type post"*) printf '%s\n' 43 ;;
+            *) return 1 ;;
+        esac
+    }
+    ALLOW_NO_SNAPSHOT=0
+    detected_bootloader() { echo grub; }
+    create_preinstall_snapshot > "$snapshot_output"
+    assert_equal "42" "$SNAPPER_PRE_NUMBER" "pre-install snapshot number must be retained"
+    assert_contains \
+        "sudo snapper -c root rollback 42 && sudo reboot" \
+        "$(<"$snapshot_output")" \
+        "snapshot creation must print the exact Snapper fallback command"
+    assert_contains \
+        "sudo -E btrfs-assistant" \
+        "$(<"$snapshot_output")" \
+        "GRUB recovery must print CachyOS's supported Btrfs Assistant command"
+    create_postinstall_snapshot >> "$snapshot_output"
+    assert_equal "43" "$SNAPPER_POST_NUMBER" "post-install snapshot number must be retained"
+); then
+    fail "available BTRFS/Snapper protection should create a pre/post pair"
+fi
+assert_contains "--type pre" "$(<"$snapshot_log")" "Snapper pre snapshot command must be executed"
+assert_contains "--type post" "$(<"$snapshot_log")" "Snapper post snapshot command must be executed"
+
+if (
+    check_snapshot_readiness() { return 1; }
+    ALLOW_NO_SNAPSHOT=0
+    create_preinstall_snapshot >/dev/null 2>&1
+); then
+    fail "production must stop when no rollback snapshot can be created"
+fi
+
+if ! (
+    check_snapshot_readiness() { return 1; }
+    export ALLOW_NO_SNAPSHOT=1
+    create_preinstall_snapshot >/dev/null
+    [ -z "$SNAPPER_PRE_NUMBER" ]
+); then
+    fail "--allow-no-snapshot must be the explicit no-snapshot exception"
+fi
+
+if ! (
+    is_cachyos() { return 0; }
+    installed_package_version() {
+        case "$1" in
+            hyprland) echo 1.0.0-1 ;;
+            aquamarine) echo 2.0.0-1 ;;
+        esac
+    }
+    hyprland_binary_path() { echo /usr/bin/Hyprland; }
+    dynamic_link_report() { echo 'libaquamarine.so.12 => /usr/lib/libaquamarine.so.12'; }
+    run_hyprland_version() { echo 'Hyprland 1.0.0'; }
+    EXPECTED_HYPRLAND_VERSION="1.0.0-1"
+    EXPECTED_AQUAMARINE_VERSION="2.0.0-1"
+    export EXPECTED_HYPRLAND_REPOSITORY="cachyos-extra"
+    validate_post_install_hyprland >/dev/null
+); then
+    fail "matching installed versions, links, and version probe must pass post-install validation"
+fi
+
+if (
+    is_cachyos() { return 0; }
+    installed_package_version() {
+        case "$1" in
+            hyprland) echo 1.0.1-1 ;;
+            aquamarine) echo 2.0.0-1 ;;
+        esac
+    }
+    export EXPECTED_HYPRLAND_VERSION="1.0.0-1"
+    export EXPECTED_AQUAMARINE_VERSION="2.0.0-1"
+    validate_post_install_hyprland >/dev/null 2>&1
+); then
+    fail "post-install validation must reject version drift"
+fi
+
+if (
+    is_cachyos() { return 0; }
+    installed_package_version() {
+        case "$1" in
+            hyprland) echo 1.0.0-1 ;;
+            aquamarine) echo 2.0.0-1 ;;
+        esac
+    }
+    hyprland_binary_path() { echo /usr/bin/Hyprland; }
+    dynamic_link_report() {
+        printf '%s\n' \
+            'libaquamarine.so.12 => /usr/lib/libaquamarine.so.12' \
+            'libbroken.so => not found'
+    }
+    EXPECTED_HYPRLAND_VERSION="1.0.0-1"
+    EXPECTED_AQUAMARINE_VERSION="2.0.0-1"
+    validate_post_install_hyprland >/dev/null 2>&1
+); then
+    fail "post-install validation must reject unresolved dynamic libraries"
+fi
+
+if (
+    is_cachyos() { return 0; }
+    installed_package_version() {
+        case "$1" in
+            hyprland) echo 1.0.0-1 ;;
+            aquamarine) echo 2.0.0-1 ;;
+        esac
+    }
+    hyprland_binary_path() { echo /usr/bin/Hyprland; }
+    dynamic_link_report() { echo 'libaquamarine.so.12 => /usr/lib/libaquamarine.so.12'; }
+    run_hyprland_version() { return 1; }
+    EXPECTED_HYPRLAND_VERSION="1.0.0-1"
+    EXPECTED_AQUAMARINE_VERSION="2.0.0-1"
+    validate_post_install_hyprland >/dev/null 2>&1
+); then
+    fail "post-install validation must reject a failing Hyprland --version probe"
+fi
 
 required_config="$test_root/pacman-required.conf"
 optional_config="$test_root/pacman-optional.conf"

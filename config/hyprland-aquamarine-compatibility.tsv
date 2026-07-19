@@ -1,0 +1,4 @@
+# hyprland_version	aquamarine_version	verified_on	evidence
+# Add a pair only after reviewing the CachyOS rebuild metadata and completing
+# the adapter regression checks. Production installs fail closed on new pairs.
+0.55.4-1.1	0.12.1-1.1	2026-07-19	CachyOS rebuilt Aquamarine before Hyprland in the same repository; SONAME and adapter regression checks passed
