@@ -13,6 +13,7 @@ PREPARE_ONLY=0
 ENABLE_AUTOLOGIN=""
 ENABLE_IWD_BACKEND=""
 OMARCHY_REF="${OMARCHY_REF:-}"
+OMARCHY_PROFILE="${OMARCHY_PROFILE:-upstream}"
 APPLIED_PATCHES=()
 
 export OMARCHY_DIR
@@ -26,6 +27,9 @@ Options:
   --prepare-only        Fetch and patch Omarchy, then stop before sudo/system changes.
   --ref <tag|branch>    Fetch this Omarchy version without the interactive menu.
                         Also honored from the OMARCHY_REF environment variable.
+  --profile <name>      Apply an optional customization profile after CachyOS
+                        patches. Supported: upstream, th3rig.
+                        Also honored from the OMARCHY_PROFILE environment variable.
   --auto-login          Allow Omarchy to configure SDDM autologin.
   --no-auto-login       Keep the existing display-manager login flow.
   --network-iwd         Configure NetworkManager to use iwd and disable wpa_supplicant.
@@ -48,6 +52,14 @@ while (($#)); do
                 exit 1
             fi
             OMARCHY_REF="$2"
+            shift
+            ;;
+        --profile)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "Error: --profile requires a value."
+                exit 1
+            fi
+            OMARCHY_PROFILE="$2"
             shift
             ;;
         --auto-login)
@@ -76,6 +88,18 @@ while (($#)); do
 done
 
 export OMARCHY_REF
+export OMARCHY_PROFILE
+
+validate_profile() {
+    case "$OMARCHY_PROFILE" in
+        upstream|th3rig)
+            ;;
+        *)
+            echo "Error: Unsupported profile '$OMARCHY_PROFILE'. Supported profiles: upstream, th3rig."
+            exit 1
+            ;;
+    esac
+}
 
 prompt_bool() {
     local prompt="$1"
@@ -196,6 +220,7 @@ print_preflight() {
     echo "  Desktop           : $desktop"
     echo "  Display manager   : $display_manager"
     echo "  NVIDIA GPU        : $nvidia"
+    echo "  Profile           : $OMARCHY_PROFILE"
     echo "  Omarchy workdir   : $OMARCHY_DIR"
     echo "  Install target    : $OMARCHY_INSTALL_DIR"
     echo ""
@@ -220,16 +245,19 @@ print_dry_run() {
     echo "  1. Fetch Omarchy into: $OMARCHY_DIR (interactive version menu, or --ref/OMARCHY_REF)."
     echo "  2. Ask for autologin and NetworkManager/iwd preferences (plus name/email for full installs)."
     echo "  3. Patch Omarchy for CachyOS: remove tldr, disable the pacman.conf replacement,"
-    echo "     disable the Plymouth/limine-snapper/hibernation steps, replace the NVIDIA setup,"
+    echo "     keep mkinitcpio hooks active, disable the Plymouth/limine-snapper/hibernation steps,"
+    echo "     replace the NVIDIA setup,"
     echo "     relax the distro/desktop/bootloader/filesystem guards, force AI-skill symlinks,"
     echo "     pin walker, and optionally configure iwd and a selectable SDDM session."
-    echo "  4. Verify every patch after applying it, aborting if upstream Omarchy has drifted."
-    echo "  5. Install yay only if missing, using a temporary build directory."
-    echo "  6. Import and locally sign Omarchy package key: $OMARCHY_KEY_ID"
-    echo "  7. Add the Omarchy pacman repo if missing, then install omarchy-keyring."
-    echo "  8. Backup /etc/sddm.conf before removing it, only when autologin is enabled."
-    echo "  9. Copy patched Omarchy files to: $OMARCHY_INSTALL_DIR"
-    echo " 10. Run Omarchy's patched install.sh unless --prepare-only is used."
+    echo "  4. Apply the selected profile overlay: $OMARCHY_PROFILE."
+    echo "  5. Verify every patch after applying it, aborting if upstream Omarchy has drifted."
+    echo "  6. Install yay only if missing, using a temporary build directory."
+    echo "  7. Import and locally sign Omarchy package key: $OMARCHY_KEY_ID"
+    echo "  8. Check CachyOS Hyprland/Aquamarine package alignment before package changes."
+    echo "  9. Add the Omarchy pacman repo if missing, then install omarchy-keyring."
+    echo " 10. Backup /etc/sddm.conf before removing it, only when autologin is enabled."
+    echo " 11. Copy patched Omarchy files to: $OMARCHY_INSTALL_DIR"
+    echo " 12. Run Omarchy's patched install.sh unless --prepare-only is used."
 }
 
 ensure_tooling() {
@@ -239,6 +267,85 @@ ensure_tooling() {
             exit 1
         fi
     done
+}
+
+first_sync_package_field() {
+    local package="$1" field="$2"
+
+    pacman -Si "$package" 2>/dev/null | awk -v field="$field" '
+        $1 == "Repository" && found == 0 { in_first = 1 }
+        in_first && index($0, field " ") == 1 {
+            sub("^[^:]+:[[:space:]]*", "")
+            print
+            exit
+        }
+        in_first && $0 == "" { exit }
+    '
+}
+
+first_sync_package_soname() {
+    local package="$1" field="$2" soname="$3"
+
+    first_sync_package_field "$package" "$field" | tr ' ' '\n' | grep -E "^${soname}=.*" | head -n 1 || true
+}
+
+installed_package_version() {
+    pacman -Q "$1" 2>/dev/null | awk '{print $2}' || true
+}
+
+check_hyprland_aquamarine_alignment() {
+    local hypr_repo hypr_version hypr_aquamarine_dep
+    local aqua_repo aqua_version aqua_provides
+    local installed_hypr installed_aqua
+
+    is_cachyos || return 0
+
+    echo "Checking CachyOS Hyprland/Aquamarine package alignment..."
+
+    hypr_repo="$(first_sync_package_field hyprland Repository)"
+    hypr_version="$(first_sync_package_field hyprland Version)"
+    hypr_aquamarine_dep="$(first_sync_package_soname hyprland "Depends On" libaquamarine.so)"
+    aqua_repo="$(first_sync_package_field aquamarine Repository)"
+    aqua_version="$(first_sync_package_field aquamarine Version)"
+    aqua_provides="$(first_sync_package_soname aquamarine Provides libaquamarine.so)"
+
+    if [ -z "$hypr_repo" ] || [ -z "$hypr_version" ] || [ -z "$aqua_repo" ] || [ -z "$aqua_version" ]; then
+        echo "Warning: Could not inspect hyprland/aquamarine sync packages; continuing."
+        return 0
+    fi
+
+    echo "  hyprland   : $hypr_version from $hypr_repo"
+    echo "  aquamarine : $aqua_version from $aqua_repo"
+
+    if [[ "$hypr_repo" != cachyos-* ]] || [[ "$aqua_repo" != cachyos-* ]]; then
+        echo "Error: hyprland/aquamarine are not both resolving from CachyOS repos."
+        echo "This can expose upstream Omarchy issue #6224-style Hyprland/Aquamarine ABI skew."
+        echo "Run a full CachyOS system update and make sure both packages resolve from CachyOS repos before installing Omarchy."
+        exit 1
+    fi
+
+    if [ "$hypr_repo" != "$aqua_repo" ]; then
+        echo "Error: hyprland and aquamarine resolve from different repos: $hypr_repo vs $aqua_repo."
+        echo "This can expose upstream Omarchy issue #6224-style Hyprland/Aquamarine ABI skew."
+        exit 1
+    fi
+
+    if [ -n "$hypr_aquamarine_dep" ] && [ -n "$aqua_provides" ] && [ "$hypr_aquamarine_dep" != "$aqua_provides" ]; then
+        echo "Error: hyprland requires $hypr_aquamarine_dep but aquamarine provides $aqua_provides."
+        echo "Update CachyOS mirrors/package databases before installing Omarchy."
+        exit 1
+    fi
+
+    installed_hypr="$(installed_package_version hyprland)"
+    installed_aqua="$(installed_package_version aquamarine)"
+
+    if [ "$installed_hypr" = "0.55.4-1" ] && [ "$installed_aqua" = "0.12.1-1" ]; then
+        echo "Error: installed hyprland/aquamarine match the known risky pair from Omarchy issue #6224."
+        echo "Run a full CachyOS update before installing Omarchy."
+        exit 1
+    fi
+
+    return 0
 }
 
 fetch_omarchy() {
@@ -455,6 +562,147 @@ SDDMEOF
     record_patch "Replaced SDDM autologin setup with a selectable Omarchy session"
 }
 
+patch_mkinitcpio_hooks_for_cachyos() {
+    local post_install_all="install/post-install/all.sh"
+    local restore_script="install/post-install/cachyos-mkinitcpio-hooks.sh"
+
+    remove_run_logged "install/preflight/all.sh" "preflight/disable-mkinitcpio.sh"
+
+    cat > "$restore_script" <<'MKINITCPIOEOF'
+#!/bin/bash
+# Sourced directly by post-install/all.sh (not run_logged/bash -c isolated),
+# so no 'set' here: install.sh already runs under 'set -eEo pipefail' and
+# adding -u would leak nounset into finished.sh, which runs right after.
+
+hooks_dir="/usr/share/libalpm/hooks"
+restored=0
+
+for hook in 60-mkinitcpio-remove 90-mkinitcpio-install; do
+  if [[ -f "$hooks_dir/$hook.hook.disabled" ]]; then
+    echo "Restoring $hook.hook"
+    sudo mv "$hooks_dir/$hook.hook.disabled" "$hooks_dir/$hook.hook"
+    restored=1
+  fi
+done
+
+if (( restored == 0 )); then
+  exit 0
+fi
+
+echo "Regenerating initramfs after restoring mkinitcpio pacman hooks..."
+
+if [[ -x /usr/share/libalpm/scripts/mkinitcpio ]]; then
+  targets=()
+  shopt -s nullglob
+  for vmlinuz in /usr/lib/modules/*/vmlinuz; do
+    targets+=("${vmlinuz#/}")
+  done
+  shopt -u nullglob
+
+  if (( ${#targets[@]} > 0 )); then
+    printf '%s\n' "${targets[@]}" | sudo /usr/share/libalpm/scripts/mkinitcpio install
+  else
+    sudo mkinitcpio -P
+  fi
+elif command -v mkinitcpio >/dev/null 2>&1; then
+  sudo mkinitcpio -P
+else
+  echo "Warning: mkinitcpio is unavailable; hooks were restored but initramfs was not regenerated."
+fi
+MKINITCPIOEOF
+    chmod +x "$restore_script"
+
+    verify_patch "mkinitcpio restore script" "$restore_script" "Regenerating initramfs" present required
+
+    if [ ! -f "$post_install_all" ]; then
+        echo "Error: [mkinitcpio post-install wiring] expected file is missing: $post_install_all"
+        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
+        echo "this adapter supports (see the CI badge in the README), or update the adapter."
+        exit 1
+    fi
+
+    if ! grep -q "post-install/cachyos-mkinitcpio-hooks.sh" "$post_install_all"; then
+        if grep -q "post-install/finished.sh" "$post_install_all"; then
+            sed -i '\#post-install/finished.sh#i source $OMARCHY_INSTALL/post-install/cachyos-mkinitcpio-hooks.sh' "$post_install_all"
+        else
+            printf '\nsource $OMARCHY_INSTALL/post-install/cachyos-mkinitcpio-hooks.sh\n' >> "$post_install_all"
+        fi
+    fi
+
+    verify_patch "mkinitcpio preflight disable removed" "install/preflight/all.sh" "preflight/disable-mkinitcpio.sh" absent required
+    verify_patch "mkinitcpio post-install wiring" "$post_install_all" "post-install/cachyos-mkinitcpio-hooks.sh" present required
+    record_patch "Kept mkinitcpio pacman hooks active and added a post-install repair for stranded disabled hooks"
+}
+
+patch_th3rig_profile() {
+    local packages_file="install/omarchy-base.packages"
+    local terminal_defaults=""
+    local fallback_terminal=""
+
+    verify_patch "profile th3rig: package list" "$packages_file" "^xdg-terminal-exec$" present required
+    verify_patch "profile th3rig: ghostty config" "config/ghostty/config" "window-theme = ghostty" present required
+
+    if [ -f "default/xdg-terminal-exec/hyprland-xdg-terminals.list" ]; then
+        terminal_defaults="default/xdg-terminal-exec/hyprland-xdg-terminals.list"
+    elif [ -f "config/xdg-terminals.list" ]; then
+        terminal_defaults="config/xdg-terminals.list"
+    else
+        echo "Error: [profile th3rig: terminal defaults] no xdg-terminal-exec defaults file was found."
+        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
+        echo "this adapter supports (see the CI badge in the README), or update the adapter."
+        exit 1
+    fi
+
+    if ! grep -qxF ghostty "$packages_file"; then
+        if grep -qxF foot "$packages_file"; then
+            sed -i '/^foot$/a ghostty' "$packages_file"
+        elif grep -qxF alacritty "$packages_file"; then
+            sed -i '/^alacritty$/a ghostty' "$packages_file"
+        else
+            printf '\nghostty\n' >> "$packages_file"
+        fi
+    fi
+    verify_patch "profile th3rig: ghostty package" "$packages_file" "^ghostty$" present required
+
+    fallback_terminal="$(grep -vE '^[[:space:]]*($|#)' "$terminal_defaults" | grep -vxF "com.mitchellh.ghostty.desktop" | head -n 1 || true)"
+    if [ -z "$fallback_terminal" ]; then
+        if grep -qxF foot "$packages_file"; then
+            fallback_terminal="foot.desktop"
+        elif grep -qxF alacritty "$packages_file"; then
+            fallback_terminal="Alacritty.desktop"
+        fi
+    fi
+
+    if [ -z "$fallback_terminal" ]; then
+        echo "Error: [profile th3rig: terminal fallback] could not determine an upstream fallback terminal."
+        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
+        echo "this adapter supports (see the CI badge in the README), or update the adapter."
+        exit 1
+    fi
+
+    cat > "$terminal_defaults" <<'TERMINALSEOF'
+# Terminal emulator preference order for xdg-terminal-exec
+# The first found and valid terminal will be used
+com.mitchellh.ghostty.desktop
+TERMINALSEOF
+    printf '%s\n' "$fallback_terminal" >> "$terminal_defaults"
+
+    verify_patch "profile th3rig: ghostty default terminal" "$terminal_defaults" "^com\\.mitchellh\\.ghostty\\.desktop$" present required
+    verify_patch "profile th3rig: fallback terminal" "$terminal_defaults" "^${fallback_terminal//./\\.}$" present required
+    record_patch "Applied th3rig profile: Ghostty is installed and preferred, with $fallback_terminal as fallback"
+}
+
+patch_profile() {
+    case "$OMARCHY_PROFILE" in
+        upstream)
+            record_patch "Kept upstream Omarchy application defaults"
+            ;;
+        th3rig)
+            patch_th3rig_profile
+            ;;
+    esac
+}
+
 patch_omarchy() {
     echo "Patching Omarchy for CachyOS compatibility..."
     cd "$OMARCHY_DIR"
@@ -468,6 +716,7 @@ patch_omarchy() {
     verify_patch "update-restart kernel detection" bin/omarchy-update-restart 'vmlinuz' present
 
     remove_run_logged "install/preflight/all.sh" "preflight/pacman.sh"
+    patch_mkinitcpio_hooks_for_cachyos
     remove_run_logged "install/login/all.sh" "login/plymouth.sh"
     remove_run_logged "install/login/all.sh" "login/limine-snapper.sh"
     remove_run_logged "install/login/all.sh" "login/hibernation.sh"
@@ -501,6 +750,7 @@ patch_omarchy() {
     patch_network_script
     patch_walker_script
     patch_sddm_script
+    patch_profile
 }
 
 install_yay_if_missing() {
@@ -603,9 +853,14 @@ print_install_summary() {
 }
 
 main() {
+    validate_profile
     print_preflight
 
     if [ "$DRY_RUN" = "1" ]; then
+        if command -v pacman >/dev/null 2>&1; then
+            check_hyprland_aquamarine_alignment
+            echo ""
+        fi
         print_dry_run
         exit 0
     fi
@@ -642,6 +897,7 @@ main() {
         exit 0
     fi
 
+    check_hyprland_aquamarine_alignment
     install_yay_if_missing
     setup_omarchy_repo
     backup_sddm_conf_for_autologin

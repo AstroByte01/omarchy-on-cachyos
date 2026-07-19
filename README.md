@@ -4,6 +4,7 @@
 
 Based on [mroboff/omarchy-on-cachyos](https://github.com/mroboff/omarchy-on-cachyos) (MIT); this is an independently maintained continuation.
 
+- UPDATE 19-Jul-2026: Re-verified all compatibility patches (mise `--shims` activation, `omarchy-update-restart` kernel detection, guard relaxations) against the current Omarchy release; no drift found. Added a CachyOS-side mitigation for upstream Omarchy issue #6188: the adapter now keeps mkinitcpio pacman hooks active during package installation and adds a post-install repair for stranded `.hook.disabled` files before reboot. Also added an opt-in `--profile th3rig` overlay for local application defaults, starting with Ghostty as the preferred terminal and the upstream terminal as the fallback.
 - UPDATE 12-Jul-2026: Every compatibility patch is now verified after applying (the installer aborts if upstream Omarchy drifts), Omarchy's hibernation setup is disabled on CachyOS, non-interactive version selection via `--ref`, and CI tests every supported Omarchy release weekly. Also: dry-run, prepare-only, safer defaults, SDDM backup, optional autologin, and optional NetworkManager/iwd changes.
 - UPDATE 20-May-2026: The install script now includes interactive version selection for choosing between Stable releases and Bleeding Edge.
 - UPDATE 1-Oct-2025: The install script has been updated to support Omarchy 3.0+ out of the box.
@@ -112,6 +113,9 @@ cd omarchy-on-cachyos
 # Optional: fetch and patch Omarchy, then stop before sudo/pacman/install.sh
 ./bin/install-omarchy-on-cachyos.sh --prepare-only --no-auto-login --keep-network
 
+# Optional: apply the th3rig opinionated overlay on top of Omarchy
+./bin/install-omarchy-on-cachyos.sh --prepare-only --profile th3rig --no-auto-login --keep-network
+
 # Run the full installer only after reviewing the dry-run and prepare-only output
 ./bin/install-omarchy-on-cachyos.sh --no-auto-login --keep-network
 ```
@@ -123,6 +127,7 @@ cd omarchy-on-cachyos
 - `--dry-run`: prints preflight state and planned actions without cloning, installing packages, touching `/etc`, changing services, or running Omarchy.
 - `--prepare-only`: fetches Omarchy and applies compatibility patches, then stops before sudo system setup, `pacman`, copying to `~/.local/share/omarchy`, or running `install.sh`. Does not prompt for name/email (those are only used by the full install).
 - `--ref <tag|branch>`: fetches that Omarchy version without showing the interactive menu (for example `--ref v3.8.2` or `--ref dev`). Also honored from the `OMARCHY_REF` environment variable.
+- `--profile <upstream|th3rig>`: applies an optional local customization overlay after the CachyOS compatibility patches. The default is `upstream`, which keeps Omarchy's application defaults. `th3rig` currently installs Ghostty and makes it the preferred terminal, while keeping the selected Omarchy release's original terminal as the fallback. Also honored from the `OMARCHY_PROFILE` environment variable.
 - `--auto-login`: allows Omarchy to configure SDDM autologin. If `/etc/sddm.conf` exists, it is backed up before removal.
 - `--no-auto-login`: keeps the existing display-manager flow, including CachyOS `plasmalogin`, and installs Omarchy as a selectable Wayland session when supported by the display manager.
 - `--network-iwd`: adds a CachyOS compatibility block that disables `wpa_supplicant` and writes `/etc/NetworkManager/conf.d/omarchy-iwd.conf`.
@@ -138,6 +143,19 @@ Recommended first pass:
 If the prepare-only output looks correct, run the full installer with the same login/network choices.
 
 If the fetched Omarchy tree already exists, the fetch step asks whether to keep or replace it; `bin/fetch-omarchy.sh` also accepts `--keep-existing` and `--force` (env `OMARCHY_ON_EXISTING=keep|replace`) for scripted runs.
+
+### Profiles
+
+Profiles are opt-in overlays for choices that are personal rather than strictly required for CachyOS compatibility. They are applied after the adapter patches upstream Omarchy, so they can be tested and re-applied without forking all of Omarchy.
+
+- `upstream`: keeps Omarchy's application defaults.
+- `th3rig`: keeps Omarchy's base, installs Ghostty, and makes Ghostty the preferred terminal through `xdg-terminal-exec`, with the selected Omarchy release's original terminal still available as a fallback.
+
+### CachyOS Safety Patches
+
+The adapter removes Omarchy's manual-install mkinitcpio hook disable step on CachyOS. This avoids upstream issue [#6188](https://github.com/basecamp/omarchy/issues/6188), where a manual install can leave `/boot` stale on GRUB systems if kernel packages change while mkinitcpio pacman hooks are disabled. The adapter also wires a post-install repair script that restores any stranded `60-mkinitcpio-remove.hook.disabled` or `90-mkinitcpio-install.hook.disabled` files and regenerates initramfs before the install finishes.
+
+For upstream issue [#6224](https://github.com/basecamp/omarchy/issues/6224), the adapter does not pin Hyprland/Aquamarine versions. Instead, it runs a CachyOS-only pre-package check before full installs, and during `--dry-run`, to make sure `hyprland` and `aquamarine` resolve from the same CachyOS repo and that the required/provided `libaquamarine.so` soname matches. If a known risky pair or mixed repo state is detected, the installer stops before changing packages.
 
 ### Supported Omarchy versions
 
