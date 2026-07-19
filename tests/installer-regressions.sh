@@ -282,6 +282,46 @@ if (
     fail "post-install validation must reject a failing Hyprland --version probe"
 fi
 
+claude_test_root="$test_root/claude"
+claude_npm_root="$claude_test_root/usr/lib/node_modules/@anthropic-ai/claude-code"
+mkdir -p "$claude_test_root/usr/bin" "$claude_npm_root/bin"
+touch "$claude_npm_root/bin/claude.exe" "$claude_test_root/usr/bin/npm"
+chmod +x "$claude_test_root/usr/bin/npm"
+ln -s ../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe "$claude_test_root/usr/bin/claude"
+
+if ! (
+    SYSTEM_CLAUDE_PATH="$claude_test_root/usr/bin/claude"
+    export SYSTEM_CLAUDE_NPM_ROOT="$claude_npm_root"
+    export SYSTEM_NPM_PATH="$claude_test_root/usr/bin/npm"
+    pacman() { return 1; }
+    sudo() { rm -f -- "$SYSTEM_CLAUDE_PATH"; }
+    remove_conflicting_unmanaged_claude_code >/dev/null
+    [[ ! -e "$SYSTEM_CLAUDE_PATH" && ! -L "$SYSTEM_CLAUDE_PATH" ]]
+); then
+    fail "the known unmanaged global Claude Code npm link should be replaced"
+fi
+
+ln -s ../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe "$claude_test_root/usr/bin/claude"
+if ! (
+    SYSTEM_CLAUDE_PATH="$claude_test_root/usr/bin/claude"
+    pacman() { return 0; }
+    sudo() { return 1; }
+    remove_conflicting_unmanaged_claude_code >/dev/null
+    [[ -L "$SYSTEM_CLAUDE_PATH" ]]
+); then
+    fail "a pacman-owned Claude Code path must be preserved"
+fi
+
+rm -f -- "$claude_test_root/usr/bin/claude"
+ln -s /opt/unexpected/claude "$claude_test_root/usr/bin/claude"
+if (
+    SYSTEM_CLAUDE_PATH="$claude_test_root/usr/bin/claude"
+    pacman() { return 1; }
+    remove_conflicting_unmanaged_claude_code >/dev/null 2>&1
+); then
+    fail "an unexpected unowned Claude Code path must fail closed"
+fi
+
 required_config="$test_root/pacman-required.conf"
 optional_config="$test_root/pacman-optional.conf"
 invalid_server_config="$test_root/pacman-invalid-server.conf"

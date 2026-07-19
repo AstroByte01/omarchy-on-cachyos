@@ -11,6 +11,9 @@ OMARCHY_REPO_SERVER='https://pkgs.omarchy.org/$arch'
 PACMAN_CONF_PATH="/etc/pacman.conf"
 COMPATIBILITY_FILE="$REPO_DIR/config/hyprland-aquamarine-compatibility.tsv"
 SNAPPER_CONFIG="root"
+SYSTEM_CLAUDE_PATH="/usr/bin/claude"
+SYSTEM_CLAUDE_NPM_ROOT="/usr/lib/node_modules/@anthropic-ai/claude-code"
+SYSTEM_NPM_PATH="/usr/bin/npm"
 
 DRY_RUN=0
 PREPARE_ONLY=0
@@ -1297,6 +1300,41 @@ install_yay_if_missing() {
     fi
 }
 
+remove_conflicting_unmanaged_claude_code() {
+    local target
+
+    if [[ ! -e "$SYSTEM_CLAUDE_PATH" && ! -L "$SYSTEM_CLAUDE_PATH" ]]; then
+        return 0
+    fi
+
+    if pacman -Qo -- "$SYSTEM_CLAUDE_PATH" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    target="$(readlink -f -- "$SYSTEM_CLAUDE_PATH" 2>/dev/null || true)"
+    case "$target" in
+        "$SYSTEM_CLAUDE_NPM_ROOT"/*) ;;
+        *)
+            echo "Error: $SYSTEM_CLAUDE_PATH is unowned by pacman and is not the expected global Claude Code npm link."
+            echo "Refusing to remove unexpected path targeting: ${target:-unresolved}"
+            return 1
+            ;;
+    esac
+
+    if [ ! -x "$SYSTEM_NPM_PATH" ]; then
+        echo "Error: $SYSTEM_NPM_PATH is required to replace the conflicting global Claude Code npm install."
+        return 1
+    fi
+
+    echo "Replacing unmanaged global Claude Code npm install with the signed pacman package..."
+    sudo "$SYSTEM_NPM_PATH" uninstall -g @anthropic-ai/claude-code
+
+    if [[ -e "$SYSTEM_CLAUDE_PATH" || -L "$SYSTEM_CLAUDE_PATH" ]]; then
+        echo "Error: $SYSTEM_CLAUDE_PATH remains after uninstalling the conflicting npm package."
+        return 1
+    fi
+}
+
 omarchy_repo_is_configured() {
     local config_file="$1"
     local repo_list
@@ -1543,6 +1581,7 @@ main() {
     check_fresh_hyprland_aquamarine_alignment
     create_preinstall_snapshot
     arm_snapshot_recovery_traps
+    remove_conflicting_unmanaged_claude_code
     install_yay_if_missing
     setup_omarchy_repo
     backup_sddm_conf_for_autologin
