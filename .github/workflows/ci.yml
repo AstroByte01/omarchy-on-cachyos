@@ -105,7 +105,7 @@ jobs:
       - name: Install tooling
         run: |
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm git sudo curl fakeroot gawk diffutils
+          pacman -Syu --noconfirm git sudo curl fakeroot gawk diffutils jq
 
       - uses: actions/checkout@v5
 
@@ -142,6 +142,8 @@ jobs:
           present 'CachyOS walker repo pin'  omarchy/install/config/walker-elephant.sh
           present 'Minimal SDDM integration' omarchy/install/login/sddm.sh
           present 'NVIDIA configuration for Omarchy on CachyOS' omarchy/install/config/hardware/nvidia.sh
+          present 'CachyOS Chromium profile preservation' omarchy/install/config/config.sh
+          present 'jq -s' omarchy/install/config/cachyos-chromium-preferences.sh
           present 'post-install/cachyos-mkinitcpio-hooks\.sh' omarchy/install/post-install/all.sh
           present 'Regenerating initramfs' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
           present 'Keeping active .*hook' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
