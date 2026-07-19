@@ -439,7 +439,7 @@ create_fresh_sync_db() {
 }
 
 validate_compatibility_manifest() {
-    local manifest="${1:-$COMPATIBILITY_FILE}"
+    local manifest="$COMPATIBILITY_FILE"
 
     if [ ! -r "$manifest" ]; then
         echo "Error: Hyprland/Aquamarine compatibility manifest is missing or unreadable: $manifest"

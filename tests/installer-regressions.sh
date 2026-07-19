@@ -162,6 +162,7 @@ snapshot_log="$test_root/snapshot.log"
 snapshot_output="$test_root/snapshot-output.log"
 if ! (
     root_filesystem_type() { echo btrfs; }
+    snapper() { return 0; }
     snapper_root_config_exists() { return 0; }
     sudo() {
         printf '%s\n' "$*" >> "$snapshot_log"
