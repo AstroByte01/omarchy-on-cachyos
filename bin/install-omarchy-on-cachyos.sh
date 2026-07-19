@@ -7,6 +7,8 @@ OMARCHY_DIR="$REPO_DIR/omarchy"
 OMARCHY_INSTALL_DIR="$HOME/.local/share/omarchy"
 OMARCHY_KEY_FINGERPRINT="40DFB630FF42BCFFB047046CF0134EE680CAC571"
 OMARCHY_KEY_ID="F0134EE680CAC571"
+OMARCHY_REPO_SERVER='https://pkgs.omarchy.org/$arch'
+PACMAN_CONF_PATH="/etc/pacman.conf"
 
 DRY_RUN=0
 PREPARE_ONLY=0
@@ -38,57 +40,59 @@ Options:
 EOF
 }
 
-while (($#)); do
-    case "$1" in
-        --dry-run)
-            DRY_RUN=1
-            ;;
-        --prepare-only)
-            PREPARE_ONLY=1
-            ;;
-        --ref)
-            if [ $# -lt 2 ] || [ -z "$2" ]; then
-                echo "Error: --ref requires a value (an Omarchy tag or branch)."
+parse_args() {
+    while (($#)); do
+        case "$1" in
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --prepare-only)
+                PREPARE_ONLY=1
+                ;;
+            --ref)
+                if [ $# -lt 2 ] || [ -z "$2" ]; then
+                    echo "Error: --ref requires a value (an Omarchy tag or branch)."
+                    exit 1
+                fi
+                OMARCHY_REF="$2"
+                shift
+                ;;
+            --profile)
+                if [ $# -lt 2 ] || [ -z "$2" ]; then
+                    echo "Error: --profile requires a value."
+                    exit 1
+                fi
+                OMARCHY_PROFILE="$2"
+                shift
+                ;;
+            --auto-login)
+                ENABLE_AUTOLOGIN=1
+                ;;
+            --no-auto-login)
+                ENABLE_AUTOLOGIN=0
+                ;;
+            --network-iwd)
+                ENABLE_IWD_BACKEND=1
+                ;;
+            --keep-network)
+                ENABLE_IWD_BACKEND=0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option: $1"
+                usage
                 exit 1
-            fi
-            OMARCHY_REF="$2"
-            shift
-            ;;
-        --profile)
-            if [ $# -lt 2 ] || [ -z "$2" ]; then
-                echo "Error: --profile requires a value."
-                exit 1
-            fi
-            OMARCHY_PROFILE="$2"
-            shift
-            ;;
-        --auto-login)
-            ENABLE_AUTOLOGIN=1
-            ;;
-        --no-auto-login)
-            ENABLE_AUTOLOGIN=0
-            ;;
-        --network-iwd)
-            ENABLE_IWD_BACKEND=1
-            ;;
-        --keep-network)
-            ENABLE_IWD_BACKEND=0
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Error: Unknown option: $1"
-            usage
-            exit 1
-            ;;
-    esac
-    shift
-done
+                ;;
+        esac
+        shift
+    done
 
-export OMARCHY_REF
-export OMARCHY_PROFILE
+    export OMARCHY_REF
+    export OMARCHY_PROFILE
+}
 
 validate_profile() {
     case "$OMARCHY_PROFILE" in
@@ -251,17 +255,18 @@ print_dry_run() {
     echo "     pin walker, and optionally configure iwd and a selectable SDDM session."
     echo "  4. Apply the selected profile overlay: $OMARCHY_PROFILE."
     echo "  5. Verify every patch after applying it, aborting if upstream Omarchy has drifted."
-    echo "  6. Install yay only if missing, using a temporary build directory."
-    echo "  7. Import and locally sign Omarchy package key: $OMARCHY_KEY_ID"
-    echo "  8. Check CachyOS Hyprland/Aquamarine package alignment before package changes."
-    echo "  9. Add the Omarchy pacman repo if missing, then install omarchy-keyring."
-    echo " 10. Backup /etc/sddm.conf before removing it, only when autologin is enabled."
-    echo " 11. Copy patched Omarchy files to: $OMARCHY_INSTALL_DIR"
-    echo " 12. Run Omarchy's patched install.sh unless --prepare-only is used."
+    echo "  6. Refresh isolated package metadata and verify Hyprland/Aquamarine alignment."
+    echo "  7. Install yay only if missing, using a temporary build directory."
+    echo "  8. Import and locally sign Omarchy package key: $OMARCHY_KEY_ID"
+    echo "  9. Validate or add the signature-required Omarchy pacman repository."
+    echo " 10. Sync pacman once, recheck the exact transaction metadata, then update."
+    echo " 11. Backup /etc/sddm.conf before removing it, only when autologin is enabled."
+    echo " 12. Copy patched Omarchy files to: $OMARCHY_INSTALL_DIR"
+    echo " 13. Run Omarchy's patched install.sh unless --prepare-only is used."
 }
 
 ensure_tooling() {
-    for cmd in curl git sudo pacman; do
+    for cmd in curl fakeroot git pacman pacman-conf realpath sudo; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo "Error: $cmd is required before running this script."
             exit 1
@@ -269,49 +274,166 @@ ensure_tooling() {
     done
 }
 
-first_sync_package_field() {
-    local package="$1" field="$2"
+first_sync_package_info() {
+    local package="$1" sync_db_path="${2:-}"
+    local -a pacman_args=()
 
-    pacman -Si "$package" 2>/dev/null | awk -v field="$field" '
-        $1 == "Repository" && found == 0 { in_first = 1 }
-        in_first && index($0, field " ") == 1 {
-            sub("^[^:]+:[[:space:]]*", "")
-            print
-            exit
-        }
-        in_first && $0 == "" { exit }
+    if [ -n "$sync_db_path" ]; then
+        pacman_args+=(--dbpath "$sync_db_path")
+    fi
+    pacman_args+=(-Si "$package")
+
+    # Consume all repo results so pipefail cannot turn an intentional first-
+    # result selection into SIGPIPE. C locale and a wide output prevent
+    # localized or terminal-width-dependent field names and wrapping.
+    LC_ALL=C COLUMNS=10000 pacman "${pacman_args[@]}" 2>/dev/null | awk '
+        /^Repository[[:space:]]*:/ { block++ }
+        block == 1 { print }
+        END { if (block == 0) exit 1 }
     '
 }
 
-first_sync_package_soname() {
-    local package="$1" field="$2" soname="$3"
+package_info_field() {
+    local package_info="$1" field="$2"
 
-    first_sync_package_field "$package" "$field" | tr ' ' '\n' | grep -E "^${soname}=.*" | head -n 1 || true
+    awk -v field="$field" '
+        function emit(value) {
+            sub(/^[[:space:]]+/, "", value)
+            if (length(value) > 0) {
+                printf "%s%s", separator, value
+                separator = " "
+            }
+        }
+        {
+            if (!found) {
+                key = $0
+                sub(/[[:space:]]*:.*/, "", key)
+                if (key == field) {
+                    value = $0
+                    sub(/^[^:]+:[[:space:]]*/, "", value)
+                    emit(value)
+                    found = 1
+                }
+                next
+            }
+
+            if ($0 ~ /^[[:space:]]+/) {
+                emit($0)
+                next
+            }
+
+            exit
+        }
+        END {
+            if (!found) exit 1
+            print ""
+        }
+    ' <<< "$package_info"
+}
+
+package_info_soname() {
+    local package_info="$1" field="$2" soname="$3"
+    local field_value token
+    local -a tokens=()
+
+    if ! field_value="$(package_info_field "$package_info" "$field")"; then
+        return 1
+    fi
+
+    read -ra tokens <<< "$field_value"
+    for token in "${tokens[@]}"; do
+        if [[ "$token" == "$soname="* ]]; then
+            printf '%s\n' "$token"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 installed_package_version() {
-    pacman -Q "$1" 2>/dev/null | awk '{print $2}' || true
+    LC_ALL=C pacman -Q "$1" 2>/dev/null | awk '{print $2}' || true
+}
+
+cleanup_fresh_sync_db() {
+    local sync_db_path="$1"
+    local temp_root canonical_path
+
+    temp_root="$(realpath -m -- "${TMPDIR:-/tmp}")"
+    canonical_path="$(realpath -m -- "$sync_db_path")"
+
+    case "$canonical_path" in
+        "$temp_root"/omarchy-pacman-db.*)
+            rm -rf -- "$canonical_path"
+            ;;
+        *)
+            echo "Error: Refusing to remove unexpected temporary pacman database: $canonical_path" >&2
+            return 1
+            ;;
+    esac
+}
+
+create_fresh_sync_db() {
+    local sync_db_path system_db_path
+    local required_cmd
+
+    for required_cmd in fakeroot pacman pacman-conf realpath; do
+        if ! command -v "$required_cmd" >/dev/null 2>&1; then
+            echo "Error: $required_cmd is required to check current CachyOS package metadata without modifying the system database." >&2
+            return 1
+        fi
+    done
+
+    sync_db_path="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-pacman-db.XXXXXX")"
+    system_db_path="$(pacman-conf DBPath)"
+
+    if [ ! -d "$system_db_path/local" ]; then
+        echo "Error: pacman's installed-package database is missing: $system_db_path/local" >&2
+        cleanup_fresh_sync_db "$sync_db_path"
+        return 1
+    fi
+
+    ln -s "$system_db_path/local" "$sync_db_path/local"
+
+    echo "Refreshing package metadata in an isolated temporary database..." >&2
+    if ! LC_ALL=C fakeroot -- pacman -Sy --noconfirm --disable-sandbox-filesystem \
+        --dbpath "$sync_db_path" --logfile /dev/null >&2; then
+        echo "Error: Could not refresh temporary pacman databases; package alignment was not verified." >&2
+        cleanup_fresh_sync_db "$sync_db_path"
+        return 1
+    fi
+
+    printf '%s\n' "$sync_db_path"
 }
 
 check_hyprland_aquamarine_alignment() {
+    local sync_db_path="${1:-}"
     local hypr_repo hypr_version hypr_aquamarine_dep
     local aqua_repo aqua_version aqua_provides
     local installed_hypr installed_aqua
+    local hypr_info aqua_info
 
     is_cachyos || return 0
 
     echo "Checking CachyOS Hyprland/Aquamarine package alignment..."
 
-    hypr_repo="$(first_sync_package_field hyprland Repository)"
-    hypr_version="$(first_sync_package_field hyprland Version)"
-    hypr_aquamarine_dep="$(first_sync_package_soname hyprland "Depends On" libaquamarine.so)"
-    aqua_repo="$(first_sync_package_field aquamarine Repository)"
-    aqua_version="$(first_sync_package_field aquamarine Version)"
-    aqua_provides="$(first_sync_package_soname aquamarine Provides libaquamarine.so)"
+    if ! hypr_info="$(first_sync_package_info hyprland "$sync_db_path")"; then
+        echo "Error: Could not inspect the current hyprland sync package; refusing to continue without the ABI check."
+        return 1
+    fi
+    if ! aqua_info="$(first_sync_package_info aquamarine "$sync_db_path")"; then
+        echo "Error: Could not inspect the current aquamarine sync package; refusing to continue without the ABI check."
+        return 1
+    fi
 
-    if [ -z "$hypr_repo" ] || [ -z "$hypr_version" ] || [ -z "$aqua_repo" ] || [ -z "$aqua_version" ]; then
-        echo "Warning: Could not inspect hyprland/aquamarine sync packages; continuing."
-        return 0
+    if ! hypr_repo="$(package_info_field "$hypr_info" Repository)" ||
+        ! hypr_version="$(package_info_field "$hypr_info" Version)" ||
+        ! hypr_aquamarine_dep="$(package_info_soname "$hypr_info" "Depends On" libaquamarine.so)" ||
+        ! aqua_repo="$(package_info_field "$aqua_info" Repository)" ||
+        ! aqua_version="$(package_info_field "$aqua_info" Version)" ||
+        ! aqua_provides="$(package_info_soname "$aqua_info" Provides libaquamarine.so)"; then
+        echo "Error: Hyprland/Aquamarine metadata is incomplete; refusing to skip the ABI check."
+        return 1
     fi
 
     echo "  hyprland   : $hypr_version from $hypr_repo"
@@ -321,19 +443,19 @@ check_hyprland_aquamarine_alignment() {
         echo "Error: hyprland/aquamarine are not both resolving from CachyOS repos."
         echo "This can expose upstream Omarchy issue #6224-style Hyprland/Aquamarine ABI skew."
         echo "Run a full CachyOS system update and make sure both packages resolve from CachyOS repos before installing Omarchy."
-        exit 1
+        return 1
     fi
 
     if [ "$hypr_repo" != "$aqua_repo" ]; then
         echo "Error: hyprland and aquamarine resolve from different repos: $hypr_repo vs $aqua_repo."
         echo "This can expose upstream Omarchy issue #6224-style Hyprland/Aquamarine ABI skew."
-        exit 1
+        return 1
     fi
 
-    if [ -n "$hypr_aquamarine_dep" ] && [ -n "$aqua_provides" ] && [ "$hypr_aquamarine_dep" != "$aqua_provides" ]; then
+    if [ "$hypr_aquamarine_dep" != "$aqua_provides" ]; then
         echo "Error: hyprland requires $hypr_aquamarine_dep but aquamarine provides $aqua_provides."
         echo "Update CachyOS mirrors/package databases before installing Omarchy."
-        exit 1
+        return 1
     fi
 
     installed_hypr="$(installed_package_version hyprland)"
@@ -342,10 +464,27 @@ check_hyprland_aquamarine_alignment() {
     if [ "$installed_hypr" = "0.55.4-1" ] && [ "$installed_aqua" = "0.12.1-1" ]; then
         echo "Error: installed hyprland/aquamarine match the known risky pair from Omarchy issue #6224."
         echo "Run a full CachyOS update before installing Omarchy."
-        exit 1
+        return 1
     fi
 
     return 0
+}
+
+check_fresh_hyprland_aquamarine_alignment() {
+    local sync_db_path status=0
+
+    is_cachyos || return 0
+
+    if ! sync_db_path="$(create_fresh_sync_db)"; then
+        return 1
+    fi
+
+    if ! check_hyprland_aquamarine_alignment "$sync_db_path"; then
+        status=1
+    fi
+
+    cleanup_fresh_sync_db "$sync_db_path" || return 1
+    return "$status"
 }
 
 fetch_omarchy() {
@@ -579,35 +718,38 @@ restored=0
 
 for hook in 60-mkinitcpio-remove 90-mkinitcpio-install; do
   if [[ -f "$hooks_dir/$hook.hook.disabled" ]]; then
+    if [[ -f "$hooks_dir/$hook.hook" ]]; then
+      echo "Keeping active $hook.hook; leaving the older disabled copy untouched"
+      continue
+    fi
+
     echo "Restoring $hook.hook"
     sudo mv "$hooks_dir/$hook.hook.disabled" "$hooks_dir/$hook.hook"
     restored=1
   fi
 done
 
-if (( restored == 0 )); then
-  exit 0
-fi
+if (( restored > 0 )); then
+  echo "Regenerating initramfs after restoring mkinitcpio pacman hooks..."
 
-echo "Regenerating initramfs after restoring mkinitcpio pacman hooks..."
+  if [[ -x /usr/share/libalpm/scripts/mkinitcpio ]]; then
+    targets=()
+    shopt -s nullglob
+    for vmlinuz in /usr/lib/modules/*/vmlinuz; do
+      targets+=("${vmlinuz#/}")
+    done
+    shopt -u nullglob
 
-if [[ -x /usr/share/libalpm/scripts/mkinitcpio ]]; then
-  targets=()
-  shopt -s nullglob
-  for vmlinuz in /usr/lib/modules/*/vmlinuz; do
-    targets+=("${vmlinuz#/}")
-  done
-  shopt -u nullglob
-
-  if (( ${#targets[@]} > 0 )); then
-    printf '%s\n' "${targets[@]}" | sudo /usr/share/libalpm/scripts/mkinitcpio install
-  else
+    if (( ${#targets[@]} > 0 )); then
+      printf '%s\n' "${targets[@]}" | sudo /usr/share/libalpm/scripts/mkinitcpio install
+    else
+      sudo mkinitcpio -P
+    fi
+  elif command -v mkinitcpio >/dev/null 2>&1; then
     sudo mkinitcpio -P
+  else
+    echo "Warning: mkinitcpio is unavailable; hooks were restored but initramfs was not regenerated."
   fi
-elif command -v mkinitcpio >/dev/null 2>&1; then
-  sudo mkinitcpio -P
-else
-  echo "Warning: mkinitcpio is unavailable; hooks were restored but initramfs was not regenerated."
 fi
 MKINITCPIOEOF
     chmod +x "$restore_script"
@@ -634,19 +776,58 @@ MKINITCPIOEOF
     record_patch "Kept mkinitcpio pacman hooks active and added a post-install repair for stranded disabled hooks"
 }
 
+terminal_defaults_file() {
+    if [ -f "default/xdg-terminal-exec/hyprland-xdg-terminals.list" ]; then
+        printf '%s\n' "default/xdg-terminal-exec/hyprland-xdg-terminals.list"
+    elif [ -f "config/xdg-terminals.list" ]; then
+        printf '%s\n' "config/xdg-terminals.list"
+    else
+        return 1
+    fi
+}
+
+patch_upstream_profile() {
+    local packages_file="install/omarchy-base.packages"
+    local terminal_defaults upstream_packages
+
+    if ! terminal_defaults="$(terminal_defaults_file)"; then
+        echo "Error: [profile upstream: terminal defaults] no xdg-terminal-exec defaults file was found."
+        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
+        echo "this adapter supports (see the CI badge in the README), or update the adapter."
+        exit 1
+    fi
+
+    restore_upstream_file "$terminal_defaults" "profile upstream terminal defaults"
+
+    if ! upstream_packages="$(git show "HEAD:$packages_file")"; then
+        echo "Error: [profile upstream: package list] could not read upstream $packages_file."
+        exit 1
+    fi
+
+    if grep -qxF ghostty <<< "$upstream_packages"; then
+        verify_patch "profile upstream: upstream ghostty package" "$packages_file" "^ghostty$" present required
+    else
+        sed -i '/^ghostty$/d' "$packages_file"
+        verify_patch "profile upstream: remove overlay ghostty package" "$packages_file" "^ghostty$" absent required
+    fi
+
+    if ! git diff --quiet -- "$terminal_defaults"; then
+        echo "Error: [profile upstream: terminal defaults] failed to restore $terminal_defaults."
+        exit 1
+    fi
+
+    record_patch "Restored upstream Omarchy application defaults"
+}
+
 patch_th3rig_profile() {
     local packages_file="install/omarchy-base.packages"
-    local terminal_defaults=""
+    local terminal_defaults
     local fallback_terminal=""
 
     verify_patch "profile th3rig: package list" "$packages_file" "^xdg-terminal-exec$" present required
     verify_patch "profile th3rig: ghostty config" "config/ghostty/config" "window-theme = ghostty" present required
 
-    if [ -f "default/xdg-terminal-exec/hyprland-xdg-terminals.list" ]; then
-        terminal_defaults="default/xdg-terminal-exec/hyprland-xdg-terminals.list"
-    elif [ -f "config/xdg-terminals.list" ]; then
-        terminal_defaults="config/xdg-terminals.list"
-    else
+    if ! terminal_defaults="$(terminal_defaults_file)"; then
         echo "Error: [profile th3rig: terminal defaults] no xdg-terminal-exec defaults file was found."
         echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
         echo "this adapter supports (see the CI badge in the README), or update the adapter."
@@ -695,7 +876,7 @@ TERMINALSEOF
 patch_profile() {
     case "$OMARCHY_PROFILE" in
         upstream)
-            record_patch "Kept upstream Omarchy application defaults"
+            patch_upstream_profile
             ;;
         th3rig)
             patch_th3rig_profile
@@ -778,6 +959,119 @@ install_yay_if_missing() {
     fi
 }
 
+omarchy_repo_is_configured() {
+    local config_file="$1"
+    local repo_list
+
+    if ! repo_list="$(LC_ALL=C pacman-conf -c "$config_file" --repo-list 2>/dev/null)"; then
+        return 1
+    fi
+
+    grep -qxF omarchy <<< "$repo_list"
+}
+
+omarchy_repo_directive_count() {
+    local config_file="$1" directive="$2"
+
+    awk -v directive="$directive" '
+        /^[[:space:]]*\[omarchy\][[:space:]]*$/ { in_repo = 1; next }
+        in_repo && /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { exit }
+        in_repo {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            if (line ~ "^" directive "[[:space:]]*=") count++
+        }
+        END { print count + 0 }
+    ' "$config_file"
+}
+
+validate_omarchy_repo_server() {
+    local config_file="$1"
+    local architecture expected_server server_output
+    local -a servers=()
+
+    if ! architecture="$(LC_ALL=C pacman-conf -c "$config_file" Architecture 2>/dev/null)" || [ -z "$architecture" ]; then
+        echo "Error: Could not determine pacman architecture from $config_file."
+        return 1
+    fi
+    expected_server="${OMARCHY_REPO_SERVER/\$arch/$architecture}"
+
+    if ! server_output="$(LC_ALL=C pacman-conf -c "$config_file" --repo omarchy Server 2>/dev/null)" || [ -z "$server_output" ]; then
+        echo "Error: [omarchy] has no readable Server in $config_file."
+        return 1
+    fi
+    mapfile -t servers <<< "$server_output"
+
+    if [ "${#servers[@]}" -ne 1 ] || [ "${servers[0]}" != "$expected_server" ]; then
+        echo "Error: Existing [omarchy] repo does not use the expected server: $expected_server"
+        return 1
+    fi
+}
+
+validate_omarchy_repo_config() {
+    local config_file="$1"
+    local siglevel_output token
+    local package_required=0 package_trusted=0 database_optional=0 database_trusted=0
+
+    if ! omarchy_repo_is_configured "$config_file"; then
+        echo "Error: [omarchy] is missing from $config_file."
+        return 1
+    fi
+    validate_omarchy_repo_server "$config_file" || return 1
+
+    if ! siglevel_output="$(LC_ALL=C pacman-conf -c "$config_file" --repo omarchy SigLevel 2>/dev/null)"; then
+        echo "Error: Could not inspect [omarchy] SigLevel in $config_file."
+        return 1
+    fi
+
+    while IFS= read -r token; do
+        case "$token" in
+            PackageRequired) package_required=1 ;;
+            PackageTrustedOnly) package_trusted=1 ;;
+            DatabaseOptional) database_optional=1 ;;
+            DatabaseTrustedOnly) database_trusted=1 ;;
+            *)
+                echo "Error: Unsafe or unsupported [omarchy] SigLevel token: $token"
+                return 1
+                ;;
+        esac
+    done <<< "$siglevel_output"
+
+    if (( ! package_required || ! package_trusted || ! database_optional || ! database_trusted )); then
+        echo "Error: [omarchy] must use Required DatabaseOptional TrustedOnly signatures."
+        return 1
+    fi
+}
+
+configure_omarchy_repo() {
+    local siglevel_count
+
+    if omarchy_repo_is_configured "$PACMAN_CONF_PATH"; then
+        validate_omarchy_repo_server "$PACMAN_CONF_PATH" || exit 1
+
+        siglevel_count="$(omarchy_repo_directive_count "$PACMAN_CONF_PATH" SigLevel)"
+        case "$siglevel_count" in
+            0)
+                sudo sed -i '/^[[:space:]]*\[omarchy\][[:space:]]*$/a SigLevel = Required DatabaseOptional TrustedOnly' "$PACMAN_CONF_PATH"
+                ;;
+            1)
+                sudo sed -i '/^[[:space:]]*\[omarchy\][[:space:]]*$/,/^[[:space:]]*\[[^]]\+\][[:space:]]*$/ s/^[[:space:]]*SigLevel[[:space:]]*=.*$/SigLevel = Required DatabaseOptional TrustedOnly/' "$PACMAN_CONF_PATH"
+                ;;
+            *)
+                echo "Error: Existing [omarchy] repo contains multiple SigLevel directives; refusing to rewrite it."
+                exit 1
+                ;;
+        esac
+    else
+        printf '\n[omarchy]\nSigLevel = Required DatabaseOptional TrustedOnly\nServer = %s\n' "$OMARCHY_REPO_SERVER" | sudo tee -a "$PACMAN_CONF_PATH" >/dev/null
+    fi
+
+    if ! validate_omarchy_repo_config "$PACMAN_CONF_PATH"; then
+        echo "Error: Refusing to synchronize an invalid or insecure [omarchy] repository configuration."
+        exit 1
+    fi
+}
+
 setup_omarchy_repo() {
     local key_file
 
@@ -790,14 +1084,14 @@ setup_omarchy_repo() {
 
     sudo pacman-key --lsign-key "$OMARCHY_KEY_ID"
 
-    if ! grep -q '^\[omarchy\]' /etc/pacman.conf; then
-        printf '\n[omarchy]\nSigLevel = Optional TrustedOnly\nServer = https://pkgs.omarchy.org/$arch\n' | sudo tee -a /etc/pacman.conf >/dev/null
-    else
-        echo "Omarchy repository already present in pacman.conf, skipping."
-    fi
+    configure_omarchy_repo
 
-    sudo pacman -Sy --needed --noconfirm omarchy-keyring
-    sudo pacman -Syu
+    # Refresh once, validate exactly those databases, then upgrade without a
+    # second refresh that could change the package set after the ABI check.
+    sudo pacman -Sy
+    check_hyprland_aquamarine_alignment
+    sudo pacman -S --needed --noconfirm omarchy-keyring
+    sudo pacman -Su
 }
 
 backup_sddm_conf_for_autologin() {
@@ -853,12 +1147,13 @@ print_install_summary() {
 }
 
 main() {
+    parse_args "$@"
     validate_profile
     print_preflight
 
     if [ "$DRY_RUN" = "1" ]; then
         if command -v pacman >/dev/null 2>&1; then
-            check_hyprland_aquamarine_alignment
+            check_fresh_hyprland_aquamarine_alignment
             echo ""
         fi
         print_dry_run
@@ -897,7 +1192,7 @@ main() {
         exit 0
     fi
 
-    check_hyprland_aquamarine_alignment
+    check_fresh_hyprland_aquamarine_alignment
     install_yay_if_missing
     setup_omarchy_repo
     backup_sddm_conf_for_autologin
@@ -909,4 +1204,6 @@ main() {
     ./install.sh
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -14,7 +14,37 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: shellcheck
-        run: shellcheck --severity=warning bin/*.sh
+        run: shellcheck --severity=warning bin/*.sh tests/*.sh
+
+  package-metadata:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install tooling
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm git sudo curl fakeroot gawk
+
+      - uses: actions/checkout@v5
+
+      - name: Exercise isolated pacman metadata refresh
+        run: |
+          set -euo pipefail
+          source ./bin/install-omarchy-on-cachyos.sh
+          sync_db=$(create_fresh_sync_db)
+          trap 'cleanup_fresh_sync_db "$sync_db"' EXIT
+
+          hypr_info=$(first_sync_package_info hyprland "$sync_db")
+          aqua_info=$(first_sync_package_info aquamarine "$sync_db")
+          hypr_dep=$(package_info_soname "$hypr_info" "Depends On" libaquamarine.so)
+          aqua_provides=$(package_info_soname "$aqua_info" Provides libaquamarine.so)
+          [ "$hypr_dep" = "$aqua_provides" ]
+
+          cleanup_fresh_sync_db "$sync_db"
+          trap - EXIT
 
   refs:
     # Mirrors the fetch menu: the 5 newest upstream tags, plus the dev branch.
@@ -42,6 +72,9 @@ jobs:
     needs: refs
     runs-on: ubuntu-latest
     container: archlinux:base
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -56,7 +89,7 @@ jobs:
       - name: Install tooling
         run: |
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm git sudo curl gawk diffutils
+          pacman -Syu --noconfirm git sudo curl fakeroot gawk diffutils
 
       - uses: actions/checkout@v5
 
@@ -95,6 +128,9 @@ jobs:
           present 'NVIDIA configuration for Omarchy on CachyOS' omarchy/install/config/hardware/nvidia.sh
           present 'post-install/cachyos-mkinitcpio-hooks\.sh' omarchy/install/post-install/all.sh
           present 'Regenerating initramfs' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
+          present 'Keeping active .*hook' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
+          absent  '^[[:space:]]*exit 0' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
+          present 'SigLevel = Required DatabaseOptional TrustedOnly' bin/install-omarchy-on-cachyos.sh
           if [ "$OMARCHY_CI_PROFILE" = "th3rig" ]; then
             present '^ghostty$' omarchy/install/omarchy-base.packages
             if [ -f omarchy/default/xdg-terminal-exec/hyprland-xdg-terminals.list ]; then
@@ -106,5 +142,33 @@ jobs:
               exit 1
             fi
             present '^com\.mitchellh\.ghostty\.desktop$' "$terminal_defaults"
+          else
+            upstream_packages=$(git -C omarchy show HEAD:install/omarchy-base.packages)
+            if ! grep -qxF ghostty <<< "$upstream_packages"; then
+              absent '^ghostty$' omarchy/install/omarchy-base.packages
+            fi
           fi
           echo "All post-state checks passed."
+
+      - name: Execute installer regression paths
+        run: ./tests/installer-regressions.sh omarchy
+
+      - name: Verify th3rig to upstream profile rollback
+        if: matrix.profile == 'th3rig'
+        run: |
+          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --profile upstream --prepare-only --no-auto-login --network-iwd
+
+          upstream_packages=$(git -C omarchy show HEAD:install/omarchy-base.packages)
+          if ! grep -qxF ghostty <<< "$upstream_packages"; then
+            if grep -qxF ghostty omarchy/install/omarchy-base.packages; then
+              echo "Ghostty overlay package remained after switching to upstream"
+              exit 1
+            fi
+          fi
+
+          if [ -f omarchy/default/xdg-terminal-exec/hyprland-xdg-terminals.list ]; then
+            terminal_defaults=default/xdg-terminal-exec/hyprland-xdg-terminals.list
+          else
+            terminal_defaults=config/xdg-terminals.list
+          fi
+          git -C omarchy diff --exit-code -- "$terminal_defaults"
