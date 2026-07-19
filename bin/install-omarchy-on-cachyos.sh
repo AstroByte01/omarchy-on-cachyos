@@ -938,6 +938,76 @@ patch_guard_for_cachyos() {
     record_patch "Relaxed Omarchy's distro/desktop/bootloader/filesystem install guards"
 }
 
+patch_chromium_preferences() {
+    local config_file="install/config/config.sh"
+    local helper_file="install/config/cachyos-chromium-preferences.sh"
+
+    cat > "$helper_file" <<'CHROMIUMEOF'
+#!/bin/bash
+
+cachyos_restore_chromium_preferences_on_exit() {
+  local status=$?
+
+  if [[ ${CACHYOS_CHROMIUM_RESTORED:-0} != 1 && -n ${CACHYOS_CHROMIUM_BACKUP:-} && -f $CACHYOS_CHROMIUM_BACKUP ]]; then
+    mkdir -p "$(dirname "$CACHYOS_CHROMIUM_PREFERENCES")"
+    cp --preserve=mode,timestamps "$CACHYOS_CHROMIUM_BACKUP" "$CACHYOS_CHROMIUM_PREFERENCES" || true
+  fi
+
+  [[ -z ${CACHYOS_CHROMIUM_BACKUP:-} ]] || rm -f "$CACHYOS_CHROMIUM_BACKUP"
+  [[ -z ${CACHYOS_CHROMIUM_MERGED:-} ]] || rm -f "$CACHYOS_CHROMIUM_MERGED"
+  return "$status"
+}
+
+cachyos_copy_config_preserving_chromium_preferences() {
+  CACHYOS_CHROMIUM_PREFERENCES="$HOME/.config/chromium/Default/Preferences"
+  CACHYOS_CHROMIUM_BACKUP=""
+  CACHYOS_CHROMIUM_MERGED=""
+  CACHYOS_CHROMIUM_RESTORED=0
+
+  if [[ -f $CACHYOS_CHROMIUM_PREFERENCES ]]; then
+    CACHYOS_CHROMIUM_BACKUP="$(mktemp "${TMPDIR:-/tmp}/omarchy-chromium-preferences.XXXXXX")" || return
+    cp --preserve=mode,timestamps "$CACHYOS_CHROMIUM_PREFERENCES" "$CACHYOS_CHROMIUM_BACKUP" || return
+    trap cachyos_restore_chromium_preferences_on_exit EXIT
+  fi
+
+  cp -R "$OMARCHY_PATH"/config/* "$HOME/.config/" || return
+
+  if [[ -n $CACHYOS_CHROMIUM_BACKUP ]]; then
+    if jq empty "$CACHYOS_CHROMIUM_BACKUP" 2>/dev/null &&
+      jq empty "$CACHYOS_CHROMIUM_PREFERENCES" 2>/dev/null; then
+      CACHYOS_CHROMIUM_MERGED="$(mktemp "${TMPDIR:-/tmp}/omarchy-chromium-merged.XXXXXX")" || return
+      jq -s '.[0] * .[1]' "$CACHYOS_CHROMIUM_BACKUP" "$CACHYOS_CHROMIUM_PREFERENCES" > "$CACHYOS_CHROMIUM_MERGED" || return
+      chmod --reference="$CACHYOS_CHROMIUM_BACKUP" "$CACHYOS_CHROMIUM_MERGED" || return
+      mv "$CACHYOS_CHROMIUM_MERGED" "$CACHYOS_CHROMIUM_PREFERENCES" || return
+      CACHYOS_CHROMIUM_MERGED=""
+    else
+      echo "Warning: preserving the existing Chromium Preferences file without merging Omarchy's defaults."
+      cp --preserve=mode,timestamps "$CACHYOS_CHROMIUM_BACKUP" "$CACHYOS_CHROMIUM_PREFERENCES" || return
+    fi
+
+    CACHYOS_CHROMIUM_RESTORED=1
+    trap - EXIT
+    rm -f "$CACHYOS_CHROMIUM_BACKUP"
+    CACHYOS_CHROMIUM_BACKUP=""
+  fi
+}
+CHROMIUMEOF
+    chmod +x "$helper_file"
+
+    if ! grep -q "CachyOS Chromium profile preservation" "$config_file"; then
+        verify_patch "Chromium preferences source" "$config_file" 'cp -R .*omarchy/config/\* .*\.config/' present required
+        sed -i '/cp -R .*omarchy\/config\/\* .*\.config\//c\
+# CachyOS Chromium profile preservation\
+source "$OMARCHY_INSTALL/config/cachyos-chromium-preferences.sh"\
+cachyos_copy_config_preserving_chromium_preferences || exit $?' "$config_file"
+    fi
+
+    verify_patch "Chromium preferences helper" "$helper_file" 'jq -s.*\.\[0\].*\.\[1\]' present required
+    verify_patch "Chromium preferences wiring" "$config_file" "CachyOS Chromium profile preservation" present required
+    verify_patch "Chromium unsafe recursive copy" "$config_file" '^cp -R .*omarchy/config/\* .*\.config/' absent required
+    record_patch "Preserved existing Chromium preferences while merging Omarchy's theme defaults"
+}
+
 patch_network_script() {
     local network_file="install/config/hardware/network.sh"
 
@@ -1269,6 +1339,7 @@ patch_omarchy() {
     fi
 
     patch_guard_for_cachyos
+    patch_chromium_preferences
     patch_network_script
     patch_walker_script
     patch_sddm_script

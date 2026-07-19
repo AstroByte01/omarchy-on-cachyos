@@ -422,6 +422,34 @@ cmp -s "$expected_setup_log" "$setup_log" || fail "ABI check must run after the 
 repair_source="$OMARCHY_TREE/install/post-install/cachyos-mkinitcpio-hooks.sh"
 [ -f "$repair_source" ] || fail "prepared mkinitcpio repair script is missing: $repair_source"
 
+chromium_helper="$OMARCHY_TREE/install/config/cachyos-chromium-preferences.sh"
+[ -f "$chromium_helper" ] || fail "prepared Chromium preferences helper is missing: $chromium_helper"
+bash -n "$chromium_helper" || fail "prepared Chromium preferences helper must parse"
+
+chromium_home="$test_root/chromium-home"
+chromium_omarchy="$test_root/chromium-omarchy"
+mkdir -p "$chromium_home/.config/chromium/Default" "$chromium_omarchy/config/chromium/Default"
+printf '%s\n' '{"browser":{"theme":{"legacy":true}},"extensions":{"settings":{"keep":true}},"profile":{"name":"Existing"}}' \
+    > "$chromium_home/.config/chromium/Default/Preferences"
+printf '%s\n' '{"browser":{"theme":{"color_scheme":2,"user_color":2}},"extensions":{"theme":{"id":""}}}' \
+    > "$chromium_omarchy/config/chromium/Default/Preferences"
+
+if ! (
+    export HOME="$chromium_home"
+    export OMARCHY_PATH="$chromium_omarchy"
+    # shellcheck source=/dev/null
+    source "$chromium_helper"
+    cachyos_copy_config_preserving_chromium_preferences
+); then
+    fail "Chromium preferences preservation helper should complete"
+fi
+
+chromium_preferences="$chromium_home/.config/chromium/Default/Preferences"
+assert_equal "Existing" "$(jq -r '.profile.name' "$chromium_preferences")" "existing Chromium profile settings must survive"
+assert_equal "true" "$(jq -r '.extensions.settings.keep' "$chromium_preferences")" "existing Chromium extension settings must survive"
+assert_equal "2" "$(jq -r '.browser.theme.color_scheme' "$chromium_preferences")" "Omarchy Chromium theme defaults must be merged"
+assert_equal "2" "$(jq -r '.browser.theme.user_color' "$chromium_preferences")" "Omarchy Chromium color default must be merged"
+
 hooks_dir="$test_root/hooks"
 repair_probe="$test_root/cachyos-mkinitcpio-hooks.sh"
 mkdir -p "$hooks_dir"
