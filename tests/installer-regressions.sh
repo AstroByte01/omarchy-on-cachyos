@@ -307,6 +307,18 @@ sed '/^SigLevel = Required DatabaseOptional TrustedOnly$/a SigLevel = Optional T
     "$required_config" > "$duplicate_siglevel_config"
 
 validate_omarchy_repo_config "$required_config" >/dev/null || fail "required Omarchy signatures should validate"
+if ! (
+    pacman-conf() {
+        case "$*" in
+            *"--repo omarchy Server") printf '%s\n' 'https://pkgs.omarchy.org/x86_64' ;;
+            *"Architecture") printf '%s\n' x86_64 x86_64_v2 x86_64_v3 x86_64_v4 ;;
+            *) return 1 ;;
+        esac
+    }
+    validate_omarchy_repo_server "$required_config" >/dev/null
+); then
+    fail "CachyOS multi-line architecture output must use the primary repo expansion"
+fi
 if validate_omarchy_repo_config "$optional_config" >/dev/null 2>&1; then
     fail "optional Omarchy package signatures must be rejected"
 fi

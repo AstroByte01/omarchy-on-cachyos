@@ -1325,13 +1325,16 @@ omarchy_repo_directive_count() {
 
 validate_omarchy_repo_server() {
     local config_file="$1"
-    local architecture expected_server server_output
+    local architecture_output architecture expected_server server_output
     local -a servers=()
 
-    if ! architecture="$(LC_ALL=C pacman-conf -c "$config_file" Architecture 2>/dev/null)" || [ -z "$architecture" ]; then
+    if ! architecture_output="$(LC_ALL=C pacman-conf -c "$config_file" Architecture 2>/dev/null)" || [ -z "$architecture_output" ]; then
         echo "Error: Could not determine pacman architecture from $config_file."
         return 1
     fi
+    # CachyOS pacman-conf reports its fallback architecture set on separate
+    # lines, while repository $arch expansion uses the primary (first) entry.
+    architecture="${architecture_output%%$'\n'*}"
     expected_server="${OMARCHY_REPO_SERVER/\$arch/$architecture}"
 
     if ! server_output="$(LC_ALL=C pacman-conf -c "$config_file" --repo omarchy Server 2>/dev/null)" || [ -z "$server_output" ]; then
