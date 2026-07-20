@@ -95,12 +95,10 @@ jobs:
       fail-fast: false
       matrix:
         ref: ${{ fromJSON(needs.refs.outputs.refs) }}
-        profile: [upstream, th3rig]
     env:
       # Passed via env, not inline interpolation: upstream tag names are
       # third-party input and must not be parsed by the shell.
       OMARCHY_CI_REF: ${{ matrix.ref }}
-      OMARCHY_CI_PROFILE: ${{ matrix.profile }}
     steps:
       - name: Install tooling
         run: |
@@ -110,12 +108,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Prepare-only patch run (drift gate)
-        run: ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --profile "$OMARCHY_CI_PROFILE" --prepare-only --no-auto-login --network-iwd
+        run: ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --prepare-only --no-auto-login --network-iwd
 
       - name: Re-run on the same tree (idempotency gate)
         run: |
           cp -a omarchy /tmp/run1
-          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --profile "$OMARCHY_CI_PROFILE" --prepare-only --no-auto-login --network-iwd
+          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --prepare-only --no-auto-login --network-iwd
           diff -ru /tmp/run1 omarchy
 
       - name: Independent post-state checks
@@ -141,6 +139,7 @@ jobs:
           present 'wifi\.backend=iwd'    omarchy/install/config/hardware/network.sh
           present 'CachyOS walker repo pin'  omarchy/install/config/walker-elephant.sh
           present 'Minimal SDDM integration' omarchy/install/login/sddm.sh
+          present '/usr/share/wayland-sessions/omarchy\.desktop' omarchy/install/login/sddm.sh
           present 'NVIDIA configuration for Omarchy on CachyOS' omarchy/install/config/hardware/nvidia.sh
           present 'CachyOS Chromium profile preservation' omarchy/install/config/config.sh
           present 'jq -s' omarchy/install/config/cachyos-chromium-preferences.sh
@@ -149,44 +148,10 @@ jobs:
           present 'Keeping active .*hook' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
           absent  '^[[:space:]]*exit 0' omarchy/install/post-install/cachyos-mkinitcpio-hooks.sh
           present 'SigLevel = Required DatabaseOptional TrustedOnly' bin/install-omarchy-on-cachyos.sh
-          if [ "$OMARCHY_CI_PROFILE" = "th3rig" ]; then
-            present '^ghostty$' omarchy/install/omarchy-base.packages
-            if [ -f omarchy/default/xdg-terminal-exec/hyprland-xdg-terminals.list ]; then
-              terminal_defaults=omarchy/default/xdg-terminal-exec/hyprland-xdg-terminals.list
-            elif [ -f omarchy/config/xdg-terminals.list ]; then
-              terminal_defaults=omarchy/config/xdg-terminals.list
-            else
-              echo "MISSING terminal defaults file"
-              exit 1
-            fi
-            present '^com\.mitchellh\.ghostty\.desktop$' "$terminal_defaults"
-          else
-            upstream_packages=$(git -C omarchy show HEAD:install/omarchy-base.packages)
-            if ! grep -qxF ghostty <<< "$upstream_packages"; then
-              absent '^ghostty$' omarchy/install/omarchy-base.packages
-            fi
-          fi
+          diff -u \
+            <(git -C omarchy show HEAD:install/omarchy-base.packages | sed '/^tldr$/d') \
+            omarchy/install/omarchy-base.packages
           echo "All post-state checks passed."
 
       - name: Execute installer regression paths
         run: ./tests/installer-regressions.sh omarchy
-
-      - name: Verify th3rig to upstream profile rollback
-        if: matrix.profile == 'th3rig'
-        run: |
-          OMARCHY_ON_EXISTING=keep ./bin/install-omarchy-on-cachyos.sh --ref "$OMARCHY_CI_REF" --profile upstream --prepare-only --no-auto-login --network-iwd
-
-          upstream_packages=$(git -C omarchy show HEAD:install/omarchy-base.packages)
-          if ! grep -qxF ghostty <<< "$upstream_packages"; then
-            if grep -qxF ghostty omarchy/install/omarchy-base.packages; then
-              echo "Ghostty overlay package remained after switching to upstream"
-              exit 1
-            fi
-          fi
-
-          if [ -f omarchy/default/xdg-terminal-exec/hyprland-xdg-terminals.list ]; then
-            terminal_defaults=default/xdg-terminal-exec/hyprland-xdg-terminals.list
-          else
-            terminal_defaults=config/xdg-terminals.list
-          fi
-          git -C omarchy diff --exit-code -- "$terminal_defaults"

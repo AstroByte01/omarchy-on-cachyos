@@ -93,6 +93,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
+login_test_root="$test_root/login"
+mkdir -p "$login_test_root/systemd" "$login_test_root/etc/sddm.conf.d" "$login_test_root/sessions"
+touch "$login_test_root/systemd/sddm.service" "$login_test_root/systemd/plasmalogin.service"
+ln -s "$login_test_root/systemd/sddm.service" "$login_test_root/display-manager.service"
+printf '%s\n' '[Autologin]' 'Session=omarchy' > "$login_test_root/etc/sddm.conf.d/90-omarchy.conf"
+
+if ! (
+    export ENABLE_AUTOLOGIN=1
+    export DISPLAY_MANAGER_LINK="$login_test_root/display-manager.service"
+    export SDDM_OMARCHY_CONFIG="$login_test_root/etc/sddm.conf.d/90-omarchy.conf"
+    validate_post_install_login >/dev/null
+); then
+    fail "autologin validation must accept an SDDM Omarchy next-boot target"
+fi
+
+rm "$login_test_root/display-manager.service"
+ln -s "$login_test_root/systemd/plasmalogin.service" "$login_test_root/display-manager.service"
+if (
+    export ENABLE_AUTOLOGIN=1
+    export DISPLAY_MANAGER_LINK="$login_test_root/display-manager.service"
+    export SDDM_OMARCHY_CONFIG="$login_test_root/etc/sddm.conf.d/90-omarchy.conf"
+    validate_post_install_login >/dev/null 2>&1
+); then
+    fail "autologin validation must reject a display-manager target that remains on Plasma"
+fi
+
+touch "$login_test_root/sessions/omarchy.desktop"
+if ! (
+    export ENABLE_AUTOLOGIN=0
+    export LOCAL_OMARCHY_SESSION="$login_test_root/sessions/omarchy.desktop"
+    export SYSTEM_OMARCHY_SESSION="$login_test_root/sessions/missing.desktop"
+    validate_post_install_login >/dev/null
+); then
+    fail "manual login validation must accept an installed Omarchy session"
+fi
+
 validate_compatibility_manifest >/dev/null || fail "repository compatibility manifest must be valid"
 compatibility_manifest_has_pair "0.55.4-1.1" "0.12.1-1.1" ||
     fail "current verified CachyOS package pair must be present"
@@ -421,6 +457,39 @@ cmp -s "$expected_setup_log" "$setup_log" || fail "ABI check must run after the 
 
 repair_source="$OMARCHY_TREE/install/post-install/cachyos-mkinitcpio-hooks.sh"
 [ -f "$repair_source" ] || fail "prepared mkinitcpio repair script is missing: $repair_source"
+
+if ! (
+    cd "$OMARCHY_TREE"
+    export ENABLE_AUTOLOGIN=1
+    patch_sddm_script
+    grep -qF "CachyOS SDDM autologin integration" install/login/sddm.sh
+    grep -qF 'systemctl disable "$CURRENT_DISPLAY_MANAGER"' install/login/sddm.sh
+    grep -qF "90-omarchy.conf" install/login/sddm.sh
+    bash -n install/login/sddm.sh
+
+    export ENABLE_AUTOLOGIN=0
+    patch_sddm_script
+    grep -qF "Minimal SDDM integration" install/login/sddm.sh
+    grep -qF "/usr/share/wayland-sessions/omarchy.desktop" install/login/sddm.sh
+    bash -n install/login/sddm.sh
+); then
+    fail "SDDM patching must support both activated and manually selectable login modes"
+fi
+
+if ! (
+    cd "$OMARCHY_TREE"
+    terminal_defaults="$(terminal_defaults_file)"
+    printf '%s\n' 'legacy-custom-terminal.desktop' > "$terminal_defaults"
+    printf '%s\n' legacy-custom-package >> install/omarchy-base.packages
+
+    restore_standard_application_defaults
+    git diff --quiet -- install/omarchy-base.packages "$terminal_defaults"
+
+    # Return the prepared tree to its standard adapter state for later checks.
+    sed -i '/^tldr$/d' install/omarchy-base.packages
+); then
+    fail "standard application defaults must remove legacy personal overrides"
+fi
 
 chromium_helper="$OMARCHY_TREE/install/config/cachyos-chromium-preferences.sh"
 [ -f "$chromium_helper" ] || fail "prepared Chromium preferences helper is missing: $chromium_helper"

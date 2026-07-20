@@ -14,6 +14,10 @@ SNAPPER_CONFIG="root"
 SYSTEM_CLAUDE_PATH="/usr/bin/claude"
 SYSTEM_CLAUDE_NPM_ROOT="/usr/lib/node_modules/@anthropic-ai/claude-code"
 SYSTEM_NPM_PATH="/usr/bin/npm"
+DISPLAY_MANAGER_LINK="/etc/systemd/system/display-manager.service"
+SDDM_OMARCHY_CONFIG="/etc/sddm.conf.d/90-omarchy.conf"
+LOCAL_OMARCHY_SESSION="/usr/local/share/wayland-sessions/omarchy.desktop"
+SYSTEM_OMARCHY_SESSION="/usr/share/wayland-sessions/omarchy.desktop"
 
 DRY_RUN=0
 PREPARE_ONLY=0
@@ -23,7 +27,6 @@ ALLOW_NO_SNAPSHOT=0
 ENABLE_AUTOLOGIN=""
 ENABLE_IWD_BACKEND=""
 OMARCHY_REF="${OMARCHY_REF:-}"
-OMARCHY_PROFILE="${OMARCHY_PROFILE:-upstream}"
 APPLIED_PATCHES=()
 EXPECTED_HYPRLAND_VERSION=""
 EXPECTED_AQUAMARINE_VERSION=""
@@ -43,16 +46,13 @@ Options:
   --prepare-only        Fetch and patch Omarchy, then stop before sudo/system changes.
   --ref <tag|branch>    Fetch this Omarchy version without the interactive menu.
                         Also honored from the OMARCHY_REF environment variable.
-  --profile <name>      Apply an optional customization profile after CachyOS
-                        patches. Supported: upstream, th3rig.
-                        Also honored from the OMARCHY_PROFILE environment variable.
   --staging-allow-unverified-pair
                         Mark this run as staging and allow a Hyprland/Aquamarine
                         pair that is not in the verified compatibility list.
   --allow-no-snapshot   Continue if a root BTRFS/Snapper snapshot cannot be made.
                         Full production installs require a snapshot by default.
-  --auto-login          Allow Omarchy to configure SDDM autologin.
-  --no-auto-login       Keep the existing display-manager login flow.
+  --auto-login          Make Omarchy the next-boot desktop through SDDM autologin.
+  --no-auto-login       Keep the current desktop as default; select Omarchy manually.
   --network-iwd         Configure NetworkManager to use iwd and disable wpa_supplicant.
   --keep-network        Do not change NetworkManager/wpa_supplicant behavior.
   -h, --help            Show this help.
@@ -74,14 +74,6 @@ parse_args() {
                     exit 1
                 fi
                 OMARCHY_REF="$2"
-                shift
-                ;;
-            --profile)
-                if [ $# -lt 2 ] || [ -z "$2" ]; then
-                    echo "Error: --profile requires a value."
-                    exit 1
-                fi
-                OMARCHY_PROFILE="$2"
                 shift
                 ;;
             --staging-allow-unverified-pair)
@@ -117,18 +109,6 @@ parse_args() {
     done
 
     export OMARCHY_REF
-    export OMARCHY_PROFILE
-}
-
-validate_profile() {
-    case "$OMARCHY_PROFILE" in
-        upstream|th3rig)
-            ;;
-        *)
-            echo "Error: Unsupported profile '$OMARCHY_PROFILE'. Supported profiles: upstream, th3rig."
-            exit 1
-            ;;
-    esac
 }
 
 prompt_bool() {
@@ -250,7 +230,6 @@ print_preflight() {
     echo "  Desktop           : $desktop"
     echo "  Display manager   : $display_manager"
     echo "  NVIDIA GPU        : $nvidia"
-    echo "  Profile           : $OMARCHY_PROFILE"
     echo "  Install mode      : $INSTALL_MODE"
     if [ "$ALLOW_NO_SNAPSHOT" = "1" ]; then
         echo "  Snapshot policy   : exception allowed"
@@ -284,8 +263,9 @@ print_dry_run() {
     echo "     keep mkinitcpio hooks active, disable the Plymouth/limine-snapper/hibernation steps,"
     echo "     replace the NVIDIA setup,"
     echo "     relax the distro/desktop/bootloader/filesystem guards, force AI-skill symlinks,"
-    echo "     pin walker, and optionally configure iwd and a selectable SDDM session."
-    echo "  4. Apply the selected profile overlay: $OMARCHY_PROFILE."
+    echo "     pin walker, and configure either an activated SDDM Omarchy session"
+    echo "     or a manually selectable session according to the login option."
+    echo "  4. Preserve Omarchy's standard application defaults."
     echo "  5. Verify every patch after applying it, aborting if upstream Omarchy has drifted."
     echo "  6. Refresh isolated package metadata and require a verified Hyprland/Aquamarine pair."
     echo "  7. Create a required root Snapper snapshot and print recovery instructions."
@@ -687,7 +667,7 @@ create_preinstall_snapshot() {
         return 1
     fi
 
-    description="Before Omarchy on CachyOS (${OMARCHY_REF:-selected ref}, profile $OMARCHY_PROFILE)"
+    description="Before Omarchy on CachyOS (${OMARCHY_REF:-selected ref})"
     if ! snapshot_output="$(sudo snapper -c "$SNAPPER_CONFIG" create --type pre --print-number \
         --cleanup-algorithm number --userdata important=yes --description "$description")"; then
         if [ "$ALLOW_NO_SNAPSHOT" = "1" ]; then
@@ -713,7 +693,7 @@ create_postinstall_snapshot() {
 
     [ -n "$SNAPPER_PRE_NUMBER" ] || return 0
 
-    description="After Omarchy on CachyOS (${OMARCHY_REF:-selected ref}, profile $OMARCHY_PROFILE)"
+    description="After Omarchy on CachyOS (${OMARCHY_REF:-selected ref})"
     if ! snapshot_output="$(sudo snapper -c "$SNAPPER_CONFIG" create --type post \
         --pre-number "$SNAPPER_PRE_NUMBER" --print-number --cleanup-algorithm number \
         --userdata important=yes --description "$description")"; then
@@ -826,6 +806,37 @@ validate_post_install_hyprland() {
     echo "  installed pair : hyprland $installed_hypr / aquamarine $installed_aqua"
     echo "  repository     : $EXPECTED_HYPRLAND_REPOSITORY"
     echo "  version probe  : $(head -n 1 <<< "$version_output")"
+}
+
+validate_post_install_login() {
+    local display_manager_target current_display_manager
+
+    if [ "$ENABLE_AUTOLOGIN" = "1" ]; then
+        display_manager_target="$(readlink -f "$DISPLAY_MANAGER_LINK" 2>/dev/null || true)"
+        current_display_manager="${display_manager_target##*/}"
+
+        if [ "$current_display_manager" != "sddm.service" ]; then
+            echo "Error: Omarchy autologin was requested, but display-manager.service does not point to sddm.service."
+            echo "  current target: ${display_manager_target:-missing}"
+            return 1
+        fi
+        if [ ! -f "$SDDM_OMARCHY_CONFIG" ] ||
+            ! grep -qxF "Session=omarchy" "$SDDM_OMARCHY_CONFIG"; then
+            echo "Error: Omarchy autologin was requested, but SDDM is not configured for Session=omarchy."
+            return 1
+        fi
+
+        echo "Post-install login validation passed: SDDM will launch Omarchy on next boot."
+        return 0
+    fi
+
+    if [ ! -f "$LOCAL_OMARCHY_SESSION" ] && [ ! -f "$SYSTEM_OMARCHY_SESSION" ]; then
+        echo "Error: manual login mode was selected, but no Omarchy Wayland session was installed."
+        return 1
+    fi
+
+    echo "Post-install login validation passed: Omarchy is selectable manually."
+    echo "Notice: the current desktop remains the next-boot default in --no-auto-login mode."
 }
 
 fetch_omarchy() {
@@ -1079,32 +1090,78 @@ patch_sddm_script() {
     local sddm_file="install/login/sddm.sh"
     local session_file="default/wayland-sessions/omarchy.desktop"
 
-    if [ "$ENABLE_AUTOLOGIN" != "0" ]; then
-        if [ -f "$sddm_file" ] && grep -q "Minimal SDDM integration" "$sddm_file"; then
-            restore_upstream_file "$sddm_file" "sddm autologin restore"
-            verify_patch "sddm autologin restore" "$sddm_file" "Minimal SDDM integration" absent required
-            record_patch "Restored Omarchy's own SDDM autologin setup (autologin allowed)"
-        else
-            record_patch "Autologin allowed: kept Omarchy's own SDDM autologin setup"
-        fi
-        return 0
-    fi
-
     if [ ! -f "$sddm_file" ]; then
-        echo "Warning: [sddm minimal session] $sddm_file not found in this Omarchy ref; skipping."
-        return 0
+        echo "Error: [sddm integration] $sddm_file not found in this Omarchy ref."
+        return 1
     fi
 
-    # The replacement script copies this file at install time; fail now, not then.
+    # The replacement scripts copy this file at install time; fail now, not then.
     verify_patch "sddm session desktop file" "$session_file" "uwsm" present required
+
+    if [ "$ENABLE_AUTOLOGIN" = "1" ]; then
+        cat > "$sddm_file" <<'SDDMEOF'
+#!/bin/bash
+set -e
+
+# CachyOS SDDM autologin integration
+omarchy-refresh-sddm
+
+sudo mkdir -p /usr/local/share/wayland-sessions
+sudo cp "$OMARCHY_PATH/default/wayland-sessions/omarchy.desktop" /usr/local/share/wayland-sessions/omarchy.desktop
+sudo cp "$OMARCHY_PATH/default/sddm/hyprland.conf" /usr/share/sddm/hyprland.conf
+
+sudo mkdir -p /etc/sddm.conf.d
+cat <<EOF | sudo tee /etc/sddm.conf.d/10-wayland.conf >/dev/null
+[General]
+DisplayServer=wayland
+
+[Wayland]
+CompositorCommand=start-hyprland -- --config /usr/share/sddm/hyprland.conf
+EOF
+
+# Override an existing CachyOS/KDE autologin session deterministically.
+cat <<EOF | sudo tee /etc/sddm.conf.d/90-omarchy.conf >/dev/null
+[Autologin]
+User=$USER
+Session=omarchy
+
+[Theme]
+Current=omarchy
+EOF
+
+sudo sed -i '/-auth.*pam_gnome_keyring\.so/d' /etc/pam.d/sddm
+sudo sed -i '/-password.*pam_gnome_keyring\.so/d' /etc/pam.d/sddm
+
+# CachyOS may already have Plasma Login Manager enabled. Merely enabling SDDM
+# does not replace its display-manager.service alias, so disable it first.
+DISPLAY_MANAGER_TARGET=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+CURRENT_DISPLAY_MANAGER=${DISPLAY_MANAGER_TARGET##*/}
+
+if [[ -n $CURRENT_DISPLAY_MANAGER && $CURRENT_DISPLAY_MANAGER != "sddm.service" ]]; then
+  echo "Switching display manager from $CURRENT_DISPLAY_MANAGER to sddm.service"
+  sudo systemctl disable "$CURRENT_DISPLAY_MANAGER"
+fi
+
+# Do not use --now: a manual install can be running inside the current desktop.
+sudo systemctl enable sddm.service
+SDDMEOF
+        chmod +x "$sddm_file"
+
+        verify_patch "sddm CachyOS autologin" "$sddm_file" "CachyOS SDDM autologin integration" present required
+        verify_patch "sddm previous-manager replacement" "$sddm_file" "Switching display manager from" present required
+        verify_patch "sddm Omarchy session override" "$sddm_file" "90-omarchy.conf" present required
+        record_patch "Configured SDDM to replace the existing display manager and launch Omarchy"
+        return 0
+    fi
 
     cat > "$sddm_file" <<'SDDMEOF'
 #!/bin/bash
 set -e
 
 # Minimal SDDM integration: install Omarchy as a selectable Wayland session.
-sudo mkdir -p /usr/local/share/wayland-sessions
+sudo mkdir -p /usr/local/share/wayland-sessions /usr/share/wayland-sessions
 sudo cp "$OMARCHY_PATH/default/wayland-sessions/omarchy.desktop" /usr/local/share/wayland-sessions/omarchy.desktop
+sudo cp "$OMARCHY_PATH/default/wayland-sessions/omarchy.desktop" /usr/share/wayland-sessions/omarchy.desktop
 SDDMEOF
     chmod +x "$sddm_file"
 
@@ -1197,107 +1254,33 @@ terminal_defaults_file() {
     fi
 }
 
-patch_upstream_profile() {
-    local packages_file="install/omarchy-base.packages"
-    local terminal_defaults upstream_packages
-
-    if ! terminal_defaults="$(terminal_defaults_file)"; then
-        echo "Error: [profile upstream: terminal defaults] no xdg-terminal-exec defaults file was found."
-        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
-        echo "this adapter supports (see the CI badge in the README), or update the adapter."
-        exit 1
-    fi
-
-    restore_upstream_file "$terminal_defaults" "profile upstream terminal defaults"
-
-    if ! upstream_packages="$(git show "HEAD:$packages_file")"; then
-        echo "Error: [profile upstream: package list] could not read upstream $packages_file."
-        exit 1
-    fi
-
-    if grep -qxF ghostty <<< "$upstream_packages"; then
-        verify_patch "profile upstream: upstream ghostty package" "$packages_file" "^ghostty$" present required
-    else
-        sed -i '/^ghostty$/d' "$packages_file"
-        verify_patch "profile upstream: remove overlay ghostty package" "$packages_file" "^ghostty$" absent required
-    fi
-
-    if ! git diff --quiet -- "$terminal_defaults"; then
-        echo "Error: [profile upstream: terminal defaults] failed to restore $terminal_defaults."
-        exit 1
-    fi
-
-    record_patch "Restored upstream Omarchy application defaults"
-}
-
-patch_th3rig_profile() {
+restore_standard_application_defaults() {
     local packages_file="install/omarchy-base.packages"
     local terminal_defaults
-    local fallback_terminal=""
-
-    verify_patch "profile th3rig: package list" "$packages_file" "^xdg-terminal-exec$" present required
-    verify_patch "profile th3rig: ghostty config" "config/ghostty/config" "window-theme = ghostty" present required
 
     if ! terminal_defaults="$(terminal_defaults_file)"; then
-        echo "Error: [profile th3rig: terminal defaults] no xdg-terminal-exec defaults file was found."
+        echo "Error: [standard application defaults] no xdg-terminal-exec defaults file was found."
         echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
         echo "this adapter supports (see the CI badge in the README), or update the adapter."
         exit 1
     fi
 
-    if ! grep -qxF ghostty "$packages_file"; then
-        if grep -qxF foot "$packages_file"; then
-            sed -i '/^foot$/a ghostty' "$packages_file"
-        elif grep -qxF alacritty "$packages_file"; then
-            sed -i '/^alacritty$/a ghostty' "$packages_file"
-        else
-            printf '\nghostty\n' >> "$packages_file"
-        fi
-    fi
-    verify_patch "profile th3rig: ghostty package" "$packages_file" "^ghostty$" present required
+    restore_upstream_file "$packages_file" "standard application packages"
+    restore_upstream_file "$terminal_defaults" "standard terminal defaults"
 
-    fallback_terminal="$(grep -vE '^[[:space:]]*($|#)' "$terminal_defaults" | grep -vxF "com.mitchellh.ghostty.desktop" | head -n 1 || true)"
-    if [ -z "$fallback_terminal" ]; then
-        if grep -qxF foot "$packages_file"; then
-            fallback_terminal="foot.desktop"
-        elif grep -qxF alacritty "$packages_file"; then
-            fallback_terminal="Alacritty.desktop"
-        fi
-    fi
-
-    if [ -z "$fallback_terminal" ]; then
-        echo "Error: [profile th3rig: terminal fallback] could not determine an upstream fallback terminal."
-        echo "Upstream Omarchy has likely changed (patch drift). Re-run selecting a release"
-        echo "this adapter supports (see the CI badge in the README), or update the adapter."
+    if ! git diff --quiet -- "$packages_file" "$terminal_defaults"; then
+        echo "Error: [standard application defaults] failed to restore upstream files."
         exit 1
     fi
 
-    cat > "$terminal_defaults" <<'TERMINALSEOF'
-# Terminal emulator preference order for xdg-terminal-exec
-# The first found and valid terminal will be used
-com.mitchellh.ghostty.desktop
-TERMINALSEOF
-    printf '%s\n' "$fallback_terminal" >> "$terminal_defaults"
-
-    verify_patch "profile th3rig: ghostty default terminal" "$terminal_defaults" "^com\\.mitchellh\\.ghostty\\.desktop$" present required
-    verify_patch "profile th3rig: fallback terminal" "$terminal_defaults" "^${fallback_terminal//./\\.}$" present required
-    record_patch "Applied th3rig profile: Ghostty is installed and preferred, with $fallback_terminal as fallback"
-}
-
-patch_profile() {
-    case "$OMARCHY_PROFILE" in
-        upstream)
-            patch_upstream_profile
-            ;;
-        th3rig)
-            patch_th3rig_profile
-            ;;
-    esac
+    record_patch "Preserved upstream Omarchy application defaults"
 }
 
 patch_omarchy() {
     echo "Patching Omarchy for CachyOS compatibility..."
     cd "$OMARCHY_DIR"
+
+    restore_standard_application_defaults
 
     sed -i '/^tldr$/d' install/omarchy-base.packages
     verify_patch "tldr removal" install/omarchy-base.packages '^tldr$' absent required
@@ -1343,7 +1326,6 @@ patch_omarchy() {
     patch_network_script
     patch_walker_script
     patch_sddm_script
-    patch_profile
 }
 
 install_yay_if_missing() {
@@ -1593,7 +1575,12 @@ print_install_summary() {
 
     if [ "$ENABLE_AUTOLOGIN" = "1" ]; then
         echo ""
-        echo "Autologin is enabled; /etc/sddm.conf was backed up first if present."
+        echo "Login mode: Omarchy will be activated through SDDM on the next boot."
+        echo "/etc/sddm.conf was backed up first if present."
+    else
+        echo ""
+        echo "Login mode: the current desktop will remain the next-boot default."
+        echo "You must select Omarchy (Hyprland uwsm) manually at the login screen."
     fi
 
     echo ""
@@ -1603,7 +1590,6 @@ print_install_summary() {
 
 main() {
     parse_args "$@"
-    validate_profile
     print_preflight
 
     if [ "$DRY_RUN" = "1" ]; then
@@ -1625,7 +1611,7 @@ main() {
     fi
 
     if [ -z "$ENABLE_AUTOLOGIN" ]; then
-        if prompt_bool "Enable Omarchy SDDM autologin? [y/N]: " "n"; then
+        if prompt_bool "Make Omarchy the next-boot desktop through SDDM autologin? [y/N]: " "n"; then
             ENABLE_AUTOLOGIN=1
         else
             ENABLE_AUTOLOGIN=0
@@ -1662,6 +1648,7 @@ main() {
     print_install_summary
     chmod +x install.sh
     ./install.sh
+    validate_post_install_login
     validate_post_install_hyprland
     create_postinstall_snapshot
     disarm_snapshot_recovery_traps
