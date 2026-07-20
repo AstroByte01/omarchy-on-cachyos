@@ -479,11 +479,23 @@ fi
 if ! (
     cd "$OMARCHY_TREE"
     terminal_defaults="$(terminal_defaults_file)"
+    index_before="$(sha256sum .git/index | awk '{print $1}')"
+    restore_standard_application_defaults
+    index_after="$(sha256sum .git/index | awk '{print $1}')"
+    assert_equal "$index_before" "$index_after" "standard default checks must not modify the Git index"
+
     printf '%s\n' 'legacy-custom-terminal.desktop' > "$terminal_defaults"
     printf '%s\n' legacy-custom-package >> install/omarchy-base.packages
 
     restore_standard_application_defaults
-    git diff --quiet -- install/omarchy-base.packages "$terminal_defaults"
+    assert_equal \
+        "$(git show HEAD:install/omarchy-base.packages)" \
+        "$(<install/omarchy-base.packages)" \
+        "standard packages must be restored from upstream"
+    assert_equal \
+        "$(git show "HEAD:$terminal_defaults")" \
+        "$(<"$terminal_defaults")" \
+        "standard terminal defaults must be restored from upstream"
 
     # Return the prepared tree to its standard adapter state for later checks.
     sed -i '/^tldr$/d' install/omarchy-base.packages

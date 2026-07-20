@@ -918,11 +918,16 @@ remove_run_logged() {
 restore_upstream_file() {
     local file="$1" name="$2"
 
-    if ! git checkout -- "$file" 2>/dev/null; then
+    if ! git cat-file -e "HEAD:$file" 2>/dev/null; then
         echo "Error: [$name] could not restore upstream $file (not a git checkout?)."
         echo "Refetch Omarchy cleanly: re-run with OMARCHY_ON_EXISTING=replace or delete $OMARCHY_DIR."
         exit 1
     fi
+
+    # Write the upstream blob without touching Git's index. Updating the index
+    # would make byte-for-byte idempotency checks fail even when the worktree
+    # content is identical after a repeated prepare-only run.
+    git show "HEAD:$file" > "$file"
 }
 
 patch_guard_for_cachyos() {
@@ -1257,6 +1262,8 @@ terminal_defaults_file() {
 restore_standard_application_defaults() {
     local packages_file="install/omarchy-base.packages"
     local terminal_defaults
+    local upstream_packages standard_packages current_packages
+    local upstream_terminals current_terminals
 
     if ! terminal_defaults="$(terminal_defaults_file)"; then
         echo "Error: [standard application defaults] no xdg-terminal-exec defaults file was found."
@@ -1265,10 +1272,32 @@ restore_standard_application_defaults() {
         exit 1
     fi
 
-    restore_upstream_file "$packages_file" "standard application packages"
-    restore_upstream_file "$terminal_defaults" "standard terminal defaults"
+    if ! upstream_packages="$(git show "HEAD:$packages_file")" ||
+        ! upstream_terminals="$(git show "HEAD:$terminal_defaults")"; then
+        echo "Error: [standard application defaults] could not read upstream files."
+        exit 1
+    fi
 
-    if ! git diff --quiet -- "$packages_file" "$terminal_defaults"; then
+    # A repeated adapter run may already have removed tldr. Accept that as the
+    # standard package state so the second run performs no writes at all.
+    standard_packages="$(sed '/^tldr$/d' <<< "$upstream_packages")"
+    current_packages="$(<"$packages_file")"
+    current_terminals="$(<"$terminal_defaults")"
+
+    if [ "$current_packages" != "$upstream_packages" ] &&
+        [ "$current_packages" != "$standard_packages" ]; then
+        printf '%s\n' "$upstream_packages" > "$packages_file"
+        current_packages="$upstream_packages"
+    fi
+
+    if [ "$current_terminals" != "$upstream_terminals" ]; then
+        printf '%s\n' "$upstream_terminals" > "$terminal_defaults"
+        current_terminals="$upstream_terminals"
+    fi
+
+    if { [ "$current_packages" != "$upstream_packages" ] &&
+        [ "$current_packages" != "$standard_packages" ]; } ||
+        [ "$current_terminals" != "$upstream_terminals" ]; then
         echo "Error: [standard application defaults] failed to restore upstream files."
         exit 1
     fi
